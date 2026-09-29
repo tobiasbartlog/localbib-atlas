@@ -1,0 +1,363 @@
+"""Atlas Journal domain tests (issue #180, slice 1) — task grammar, day
+sections, the line operations and the Wochenziel frontmatter."""
+from __future__ import annotations
+
+import pytest
+
+from atlas.journal import (
+    JOURNAL_SCHEMA,
+    Journal,
+    append_task,
+    delete_task,
+    find_task,
+    goal_progress,
+    goals_progress,
+    move_task,
+    new_journal,
+    parse_days,
+    parse_journal,
+    parse_task_text,
+    parse_tasks,
+    render_journal,
+    reorder_task,
+    replace_task,
+    toggle_task,
+)
+
+FENCE = "```"
+
+BODY = "\n".join(
+    [
+        "## Montag 2026-09-21",
+        "- [ ] Einleitung schreiben [[kap-einleitung]] #schreiben",
+        "- [x] Literatur sichten",
+        "",
+        FENCE,
+        "- [ ] steht im Code-Fence",
+        FENCE,
+        "",
+        "## Dienstag 2026-09-22",
+        "- [ ] Methodik ausbauen [[kap-methodik|Methodik]] [[pub-abc]] #lesen #schreiben",
+        "- [ ] Mail an Betreuer →2026-09-23",
+        "- [ ] Uebernommen ←2026-09-20",
+        "",
+    ]
+)
+
+FRONTMATTER = (
+    "---\n"
+    f"schema: {JOURNAL_SCHEMA}\n"
+    "week: 2026-W39\n"
+    "goals:\n"
+    "- title: Kapitel 3 fertig\n"
+    "  anchor: kap-methodik\n"
+    "- title: Taeglich lesen\n"
+    "  tag: lesen\n"
+    "---\n\n"
+)
+
+FILE = FRONTMATTER + BODY
+
+
+def lines(body: str) -> list[str]:
+    return body.split("\n")
+
+
+def assert_only_line_changed(before: str, after: str, index: int) -> None:
+    """Every line but ``index`` is byte-identical (ADR-0020)."""
+    a, b = lines(before), lines(after)
+    assert len(a) == len(b)
+    assert a[:index] == b[:index]
+    assert a[index + 1:] == b[index + 1:]
+    assert a[index] != b[index]
+
+
+# =============================================================================
+# Parser
+# =============================================================================
+
+def test_parse_days_returns_the_day_sections_with_their_tasks():
+    days = parse_days(BODY)
+    assert [d["date"] for d in days] == ["2026-09-21", "2026-09-22"]
+    assert [d["weekday"] for d in days] == ["Montag", "Dienstag"]
+    assert [d["total"] for d in days] == [2, 3]
+    assert [d["done"] for d in days] == [1, 0]
+
+
+def test_body_index_is_continuous_across_days_and_skips_fences():
+    tasks = parse_tasks(BODY)
+    assert [t["body_index"] for t in tasks] == [0, 1, 2, 3, 4]
+    assert [t["text"] for t in tasks][:2] == ["Einleitung schreiben", "Literatur sichten"]
+    assert all("Code-Fence" not in t["text"] for t in tasks)
+
+
+def test_tasks_carry_their_day_date():
+    tasks = parse_tasks(BODY)
+    assert [t["day"] for t in tasks] == [
+        "2026-09-21", "2026-09-21", "2026-09-22", "2026-09-22", "2026-09-22",
+    ]
+
+
+def test_several_anchors_including_a_display_label():
+    task = parse_tasks(BODY)[2]
+    assert task["anchors"] == ["kap-methodik", "pub-abc"]
+    assert task["tags"] == ["lesen", "schreiben"]
+    assert task["text"] == "Methodik ausbauen"
+
+
+def test_markers_are_read_and_stripped_from_the_display_text():
+    moved_away, carried_in = parse_tasks(BODY)[3], parse_tasks(BODY)[4]
+    assert moved_away["moved_to"] == "2026-09-23"
+    assert moved_away["moved_from"] is None
+    assert moved_away["text"] == "Mail an Betreuer"
+    assert carried_in["moved_from"] == "2026-09-20"
+    assert carried_in["text"] == "Uebernommen"
+
+
+def test_a_moved_task_is_no_longer_open_and_a_done_one_is_not_either():
+    tasks = parse_tasks(BODY)
+    assert [t["open"] for t in tasks] == [True, False, True, False, True]
+
+
+def test_checklist_lines_before_the_first_day_have_no_day_but_consume_an_index():
+    body = "- [ ] Streuner\n\n## Montag 2026-09-21\n- [ ] Echt\n"
+    tasks = parse_tasks(body)
+    assert [(t["body_index"], t["day"]) for t in tasks] == [
+        (0, None), (1, "2026-09-21")
+    ]
+
+
+def test_parse_task_text_handles_both_markers_once():
+    parsed = parse_task_text("Text [[a]] #t ←2026-09-20 →2026-09-24")
+    assert parsed == {
+        "text": "Text",
+        "anchors": ["a"],
+        "tags": ["t"],
+        "moved_to": "2026-09-24",
+        "moved_from": "2026-09-20",
+    }
+
+
+# =============================================================================
+# Serializer — line operations
+# =============================================================================
+
+def test_round_trip_without_an_operation_is_identical():
+    fm, body = parse_journal(FILE)
+    assert body == BODY
+    assert render_journal(fm, body) == FILE
+    assert Journal.from_markdown(FILE).to_markdown() == FILE
+
+
+def test_append_task_to_an_existing_day_leaves_every_other_line_untouched():
+    after, index = append_task(BODY, "2026-09-21", "Neuer Task [[kap-einleitung]]")
+    assert index == 2  # inserted before the Dienstag tasks
+    before_lines, after_lines = lines(BODY), lines(after)
+    # End of the Montag section: after its code fence, before the blank line
+    # that separates the day blocks.
+    assert after_lines[7] == "- [ ] Neuer Task [[kap-einleitung]]"
+    assert before_lines[:7] == after_lines[:7]
+    assert before_lines[7:] == after_lines[8:]
+
+
+def test_append_task_creates_a_missing_day_heading_in_ascending_order():
+    body = "## Montag 2026-09-21\n- [ ] A\n\n## Mittwoch 2026-09-23\n- [ ] C\n"
+    after, index = append_task(body, "2026-09-22", "B")
+    assert after == (
+        "## Montag 2026-09-21\n- [ ] A\n\n"
+        "## Dienstag 2026-09-22\n- [ ] B\n\n"
+        "## Mittwoch 2026-09-23\n- [ ] C\n"
+    )
+    assert index == 1
+    assert [d["date"] for d in parse_days(after)] == [
+        "2026-09-21", "2026-09-22", "2026-09-23"
+    ]
+
+
+def test_append_task_appends_a_later_day_at_the_end():
+    body = "## Montag 2026-09-21\n- [ ] A\n"
+    after, index = append_task(body, "2026-09-23", "C")
+    assert after == "## Montag 2026-09-21\n- [ ] A\n\n## Mittwoch 2026-09-23\n- [ ] C\n"
+    assert index == 1
+
+
+def test_append_task_builds_the_body_from_scratch_when_it_is_empty():
+    after, index = append_task("", "2026-09-23", "Erster Task #start")
+    assert after == "## Mittwoch 2026-09-23\n- [ ] Erster Task #start\n"
+    assert index == 0
+    assert parse_tasks(after)[0]["tags"] == ["start"]
+
+
+def test_append_task_writes_the_text_verbatim_on_one_line():
+    after, _ = append_task("", "2026-09-23", "  Zeile eins\n  Zeile zwei  ")
+    assert after == "## Mittwoch 2026-09-23\n- [ ] Zeile eins Zeile zwei\n"
+
+
+def test_toggle_changes_exactly_one_line():
+    after = toggle_task(BODY, 0)
+    assert_only_line_changed(BODY, after, 1)
+    assert parse_tasks(after)[0]["done"] is True
+    assert toggle_task(after, 0) == BODY
+
+
+def test_replace_keeps_the_checkbox_state_and_every_other_line():
+    after = replace_task(BODY, 1, "Literatur wirklich sichten [[pub-abc]]")
+    assert_only_line_changed(BODY, after, 2)
+    assert lines(after)[2] == "- [x] Literatur wirklich sichten [[pub-abc]]"
+    assert parse_tasks(after)[1]["done"] is True
+
+
+def test_delete_removes_exactly_one_line():
+    after = delete_task(BODY, 2)
+    before_lines, after_lines = lines(BODY), lines(after)
+    assert len(after_lines) == len(before_lines) - 1
+    assert before_lines[:9] == after_lines[:9]
+    assert before_lines[10:] == after_lines[9:]
+    assert [t["body_index"] for t in parse_tasks(after)] == [0, 1, 2, 3]
+
+
+def test_unknown_body_index_raises():
+    for op in (toggle_task, delete_task):
+        with pytest.raises(KeyError):
+            op(BODY, 99)
+
+
+def test_move_inside_the_same_week_marks_the_source_and_appends_the_target():
+    result = move_task(BODY, 0, "2026-09-22")
+    assert result.same_body is True
+    body = result.target_body
+    assert lines(body)[1] == (
+        "- [ ] Einleitung schreiben [[kap-einleitung]] #schreiben →2026-09-22"
+    )
+    source, target = parse_tasks(body)[0], find_task(body, result.target_index)
+    assert source["moved_to"] == "2026-09-22"
+    assert source["open"] is False
+    assert target["day"] == "2026-09-22"
+    assert target["moved_from"] == "2026-09-21"
+    assert target["anchors"] == ["kap-einleitung"]
+    assert target["open"] is True
+
+
+def test_move_leaves_all_other_lines_byte_identical():
+    result = move_task(BODY, 1, "2026-09-22")
+    before, after = lines(BODY), lines(result.target_body)
+    assert len(after) == len(before) + 1
+    assert before[:2] == after[:2]
+    assert before[3:11] == after[3:11]  # everything between source and target
+
+
+def test_move_into_another_week_uses_the_target_body():
+    target_body = "## Montag 2026-09-28\n- [ ] Schon da\n"
+    result = move_task(BODY, 3, "2026-09-28", target_body=target_body)
+    assert result.same_body is False
+    assert parse_tasks(result.source_body)[3]["moved_to"] == "2026-09-28"
+    carried = find_task(result.target_body, result.target_index)
+    assert carried["day"] == "2026-09-28"
+    assert carried["text"] == "Mail an Betreuer"
+    assert carried["moved_to"] is None  # the old → marker does not travel
+    assert carried["moved_from"] == "2026-09-22"
+
+
+def test_move_replaces_an_existing_origin_marker_instead_of_adding_a_second():
+    result = move_task(BODY, 4, "2026-09-23")
+    carried = find_task(result.target_body, result.target_index)
+    assert carried["moved_from"] == "2026-09-22"
+    raw = lines(result.target_body)[result_line(result.target_body, result.target_index)]
+    assert raw.count("←") == 1
+
+
+def result_line(body: str, body_index: int) -> int:
+    return find_task(body, body_index)["line"]
+
+
+def test_reorder_moves_a_task_inside_its_day():
+    after = reorder_task(BODY, 4, 0)
+    day = parse_days(after)[1]
+    assert [t["text"] for t in day["tasks"]] == [
+        "Uebernommen", "Methodik ausbauen", "Mail an Betreuer"
+    ]
+    # Nothing outside the Dienstag block moved.
+    assert lines(BODY)[:9] == lines(after)[:9]
+    assert sorted(lines(BODY)) == sorted(lines(after))
+
+
+def test_reorder_to_the_same_position_is_a_no_op():
+    assert reorder_task(BODY, 2, 0) == BODY
+
+
+# =============================================================================
+# Frontmatter, Wochenziele, validation
+# =============================================================================
+
+def test_journal_reads_week_and_goals():
+    journal = Journal.from_markdown(FILE, id_hint="2026-W39")
+    assert journal.week == "2026-W39"
+    assert journal.goals == [
+        {"title": "Kapitel 3 fertig", "anchor": "kap-methodik", "tag": None, "done": False},
+        {"title": "Taeglich lesen", "anchor": None, "tag": "lesen", "done": False},
+    ]
+
+
+def test_rewriting_the_goals_leaves_the_body_byte_identical():
+    journal = Journal.from_markdown(FILE, id_hint="2026-W39")
+    journal.goals.append({"title": "Neues Ziel", "done": True})
+    text = journal.to_markdown()
+    assert parse_journal(text)[1] == BODY
+    assert "Neues Ziel" in text
+    assert Journal.from_markdown(text).goals[-1]["done"] is True
+
+
+def test_goal_progress_counts_by_anchor_and_by_tag():
+    tasks = parse_tasks(BODY)
+    by_anchor = goal_progress({"title": "Kapitel 3", "anchor": "kap-methodik"}, tasks)
+    assert (by_anchor["total"], by_anchor["done_count"]) == (1, 0)
+    by_tag = goal_progress({"title": "Schreiben", "tag": "schreiben"}, tasks)
+    assert (by_tag["total"], by_tag["done_count"]) == (2, 0)
+    assert by_tag["progress"] == 0.0
+
+
+def test_goal_without_anchor_and_tag_is_only_its_manual_done_flag():
+    tasks = parse_tasks(BODY)
+    assert goal_progress({"title": "Frei", "done": True}, tasks)["progress"] == 1.0
+    assert goal_progress({"title": "Frei"}, tasks)["progress"] == 0.0
+
+
+def test_goals_progress_keeps_the_frontmatter_index():
+    journal = Journal.from_markdown(FILE, id_hint="2026-W39")
+    rows = goals_progress(journal.goals, parse_tasks(BODY))
+    assert [r["index"] for r in rows] == [0, 1]
+    assert rows[1]["total"] == 1  # only the Methodik task carries #lesen
+
+
+def test_validate_accepts_a_sound_week():
+    journal = Journal(week="2026-W39", body=BODY)
+    journal.path = "/atlas/journal/2026-W39.md"
+    assert journal.validate() == []
+
+
+def test_validate_rejects_a_day_outside_the_week():
+    journal = Journal(week="2026-W40", body=BODY)
+    errors = journal.validate()
+    assert any("2026-09-21" in e and "ausserhalb" in e for e in errors)
+
+
+def test_validate_rejects_more_than_five_goals():
+    journal = Journal(week="2026-W39", goals=[{"title": f"Z{i}"} for i in range(6)])
+    assert any("hoechstens 5" in e for e in journal.validate())
+
+
+def test_validate_rejects_a_week_that_is_not_the_filename():
+    journal = Journal(week="2026-W39", path="/atlas/journal/2026-W40.md")
+    assert any("Dateiname" in e for e in journal.validate())
+
+
+def test_validate_rejects_a_malformed_week_id():
+    assert any("ISO-Wochen-ID" in e for e in Journal(week="2026-39").validate())
+
+
+def test_new_journal_is_empty_and_rejects_a_bad_week():
+    journal = new_journal("2026-W39")
+    assert journal.tasks == [] and journal.days == []
+    assert journal.to_markdown() == f"---\nschema: {JOURNAL_SCHEMA}\nweek: 2026-W39\n---\n\n"
+    with pytest.raises(ValueError):
+        new_journal("2025-W53")  # 2025 has only 52 ISO weeks

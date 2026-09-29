@@ -1,0 +1,16 @@
+# What the Atlas Bundle needs to run its own tests WITHOUT the LocalBib core
+# (#188, the isolated CI job). The contract package comes on top:
+#
+#     pip install ./plugin_api -r plugins/atlas/requirements-dev.txt
+#
+# Runtime libraries Atlas imports itself (the core happens to ship them too,
+# but a Bundle must not rely on that):
+fastapi>=0.115.0,<0.116  # the Add-on's router
+python-multipart>=0.0.6  # UploadFile (manuscripts, project documents)
+PyYAML>=6.0              # YAML frontmatter of the archive's Markdown files
+watchdog>=4.0.0          # archive watcher
+PyMuPDF>=1.24.0          # text of project documents (extraction proposal)
+# Test tools
+pytest>=8.0.0
+httpx>=0.27.0            # FastAPI TestClient transport
+import-linter>=2.0       # plugins/atlas/.importlinter (P3 boundary)

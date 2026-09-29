@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.idea/2",
+  "title": "Atlas Idea Frontmatter",
+  "description": "YAML frontmatter of an Atlas idea (ideen/*.md). v2 (ADR-0004, issue #46): statuses simplify to seed -> developing -> promoted -> parked; drafting/publishing state lives on the Publication. The startup migration maps legacy /1 statuses (drafting -> developing, published -> promoted). Single source of truth (P6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "type", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.idea/2"
+    },
+    "id": {
+      "type": "string",
+      "description": "Slug, immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": ["paper-idea", "tool-idea", "experiment"]
+    },
+    "status": {
+      "type": "string",
+      "description": "seed -> developing -> promoted -> parked. 'promoted' means a Publication was derived from this idea (Promote action); the idea file stays as history (P1).",
+      "enum": ["seed", "developing", "promoted", "parked"]
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "BibTeX citekeys → join to the LocalBib library.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "diss": {
+      "type": "array",
+      "description": "IDs of dissertation nodes this idea feeds into.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "venue": {
+      "type": "string"
+    },
+    "created": {
+      "type": "string",
+      "format": "date"
+    },
+    "updated": {
+      "type": "string",
+      "format": "date"
+    }
+  }
+}

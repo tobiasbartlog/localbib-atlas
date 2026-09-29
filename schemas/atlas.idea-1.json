@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.idea/1",
+  "title": "Atlas Idea Frontmatter",
+  "description": "YAML frontmatter of an Atlas idea (ideen/*.md). Architektur Abschn. 4.1. Single source of truth (P6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "type", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.idea/1"
+    },
+    "id": {
+      "type": "string",
+      "description": "Slug, immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": ["paper-idea", "tool-idea", "experiment"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["seed", "developing", "drafting", "parked", "published"]
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "BibTeX citekeys → join to the LocalBib library.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "diss": {
+      "type": "array",
+      "description": "IDs of dissertation nodes this idea feeds into.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "venue": {
+      "type": "string"
+    },
+    "created": {
+      "type": "string",
+      "format": "date"
+    },
+    "updated": {
+      "type": "string",
+      "format": "date"
+    }
+  }
+}

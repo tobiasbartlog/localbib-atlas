@@ -1,0 +1,43 @@
+# P3 — "Eine Grenze, ein Vertrag" fuer das Atlas-Bundle (ADR-0021, #188).
+#
+# Atlas importiert ausschliesslich aus plugin_api (plus stdlib und seinen
+# Drittbibliotheken), nie aus dem LocalBib-Kern. Aus diesem Ordner pruefen:
+#
+#     cd plugins/atlas && lint-imports
+#
+# Der Kern muss dafuer nicht installiert sein: include_external_packages
+# erfasst jeden Import ausserhalb von `atlas` mit seinem Top-Level-Namen, der
+# Vertrag verbietet die Namen der Kernmodule. Laeuft im Haupt-CI-Job und im
+# isolierten Atlas-Job (nur Bundle + Contract-Paket installiert).
+[importlinter]
+root_packages =
+    atlas
+include_external_packages = True
+
+[importlinter:contract:atlas-only-plugin-api]
+name = Atlas importiert nur aus plugin_api, nie aus dem Kern
+type = forbidden
+source_modules =
+    atlas
+forbidden_modules =
+    webapp
+    literature_manager
+    config
+    context
+    database
+    registry
+    plugin_loader
+    plugins_config
+    settings_store
+    host_services
+    llm_client
+    llm_config
+    openalex_client
+    paper_matcher
+    citation_graph_builder
+    network_orchestrator
+    metadata_validation
+    validation_policy
+    routers
+    services
+    hipster

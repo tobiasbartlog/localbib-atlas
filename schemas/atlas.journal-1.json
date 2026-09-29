@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.journal/1",
+  "title": "Atlas Journal Frontmatter",
+  "description": "YAML frontmatter of a Journal (journal/*.md) — the Markdown file of ONE ISO week, id = filename = the week id YYYY-Www (issue #180). The frontmatter carries only the week and its Wochenziele; the work itself lives in the body: a day is a heading of the topmost level '## <Wochentag> YYYY-MM-DD' (the DATE is authoritative, the weekday is decoration written by Atlas), and under it GFM checklists — the Tasks. Day sections come into being with their first Task and are kept in ascending date order; a date outside the week is a validation error. Task line grammar (body, never frontmatter): '- [ ] <Text> [[anker]]… #tag… →YYYY-MM-DD' resp. '←YYYY-MM-DD' — Anker and Tags stand anywhere in the text, the text without Anker/Tags/markers is the display; '→date' marks the source line of an Übertrag (moved, no longer open), '←date' the target line (origin). Both markers at most once per line. Writes are LINE operations (ADR-0020): every other line stays byte-identical.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "week"],
+  "properties": {
+    "schema": {
+      "const": "atlas.journal/1"
+    },
+    "week": {
+      "type": "string",
+      "description": "ISO week id, immutable, equals filename without .md.",
+      "pattern": "^\\d{4}-W\\d{2}$"
+    },
+    "goals": {
+      "type": "array",
+      "description": "Wochenziele — at most five. A goal with an anchor or a tag counts the matching Tasks of the week as its progress; without both, the manual done flag is the whole progress.",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "anchor": {
+            "type": "string",
+            "description": "Id of an Atlas entity (Kapitel, Veroeffentlichung, Projekt, Idee, Zettel). Hanging anchors are warnings, never auto-repaired."
+          },
+          "tag": {
+            "type": "string",
+            "description": "Tag without the leading '#'."
+          },
+          "done": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "default": []
+    }
+  }
+}

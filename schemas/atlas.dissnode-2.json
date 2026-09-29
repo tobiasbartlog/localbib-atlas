@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.dissnode/2",
+  "title": "Atlas Dissertation Node Frontmatter",
+  "description": "YAML frontmatter of a dissertation node (dissertation/*.md). The tree is built solely from parent + order. v2 (ADR-0004, issue #53): nodes link the user's own Publications via `publications` (allowed on any kind); the direct `paper_ref` Cite-Key link is dropped — the startup migration surfaces old values as a warning list for manual re-linking, never auto-converted. `paper-slot` stays as a semantic placeholder kind.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "kind", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.dissnode/2"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["part", "chapter", "section", "paper-slot"]
+    },
+    "parent": {
+      "type": ["string", "null"],
+      "description": "id of the parent node; null = root.",
+      "default": null
+    },
+    "order": {
+      "type": "integer",
+      "description": "Sort order among siblings."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["planned", "in-progress", "submitted", "published"]
+    },
+    "publications": {
+      "type": "array",
+      "description": "IDs of the user's own Publications (veroeffentlichungen/*.md) this node is planned around. Allowed on any kind. Hanging IDs are warnings, never auto-repaired.",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

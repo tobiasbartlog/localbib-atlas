@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.dissnode/1",
+  "title": "Atlas Dissertation Node Frontmatter",
+  "description": "YAML frontmatter of a dissertation node (dissertation/*.md). Architektur Abschn. 4.2. The tree is built solely from parent + order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "kind", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.dissnode/1"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["part", "chapter", "section", "paper-slot"]
+    },
+    "parent": {
+      "type": ["string", "null"],
+      "description": "id of the parent node; null = root.",
+      "default": null
+    },
+    "order": {
+      "type": "integer",
+      "description": "Sort order among siblings."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["planned", "in-progress", "submitted", "published"]
+    },
+    "paper_ref": {
+      "type": ["string", "null"],
+      "description": "Citekey after publication → entry in the library. Only meaningful for kind=paper-slot.",
+      "default": null
+    }
+  }
+}

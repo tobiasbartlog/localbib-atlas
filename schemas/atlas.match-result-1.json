@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.match-result/1",
+  "title": "Atlas LLM Match Result",
+  "description": "Result of an LLM pair evaluation (F1: paper vs. idea) or one entry of a bundled reverse search (F2: paper vs. top-k ideas). Architektur Abschn. 8. Wire format only — never persisted; accepting a match writes Markdown (P4). Single source of truth (P6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reasoning"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["relevant", "maybe", "irrelevant"]
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "Short justification, shown to the user as part of the proposal."
+    },
+    "usages": {
+      "type": "array",
+      "description": "Where in the idea the paper could be used. anchor refers to a section slug of the idea body; anchors are revalidated on display, orphaned ones are flagged, never dropped.",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["anchor", "suggestion"],
+        "properties": {
+          "anchor": {
+            "type": ["string", "null"],
+            "description": "Section slug of the idea body, or null for 'no specific section'."
+          },
+          "suggestion": {
+            "type": "string",
+            "description": "What the paper contributes at this point."
+          },
+          "anchor_valid": {
+            "type": "boolean",
+            "description": "Derived on display: does the anchor still exist in the idea body?"
+          }
+        }
+      }
+    },
+    "idea": {
+      "type": "string",
+      "description": "Idea id this entry refers to (set in F2 batch results)."
+    },
+    "citekey": {
+      "type": "string",
+      "description": "Library citekey of the evaluated paper."
+    }
+  }
+}

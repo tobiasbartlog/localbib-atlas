@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.project/3",
+  "title": "Atlas Research Project Frontmatter",
+  "description": "YAML frontmatter of a research project / Forschungsprojekt (projekte/*.md). ADR-0004: atlas.project/3 is a DIFFERENT entity than atlas.project/1|2 — those are legacy Publications and are migrated to atlas.publication/1 at startup. Carries the funded-project facts (Laufzeit, funder, Foerderkennzeichen, role), structured milestones (rendered as a timeline with next/overdue indication) and project-relevant literature refs (Paper cite keys; hanging refs are warnings, never auto-repaired). Work packages live in the Markdown body as headings with GFM checklists, not in the frontmatter.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.project/3"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "description": "Lifecycle planned → applied → active → finished, plus terminal rejected.",
+      "enum": ["planned", "applied", "active", "finished", "rejected"]
+    },
+    "start": {
+      "type": "string",
+      "description": "Laufzeit start.",
+      "format": "date"
+    },
+    "end": {
+      "type": "string",
+      "description": "Laufzeit end.",
+      "format": "date"
+    },
+    "funder": {
+      "type": "string",
+      "description": "Funding body (e.g. DFG, BMBF, EU)."
+    },
+    "grant_id": {
+      "type": "string",
+      "description": "Foerderkennzeichen / grant number."
+    },
+    "role": {
+      "type": "string",
+      "description": "Own role in the project (e.g. PI, Mitarbeiter, Antragsteller)."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "Project-relevant literature as Paper cite keys → join to the LocalBib library. Hanging refs are warnings, never auto-repaired.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "milestones": {
+      "type": "array",
+      "description": "Structured milestones — the UI renders a timeline with next/overdue indication.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "date": {
+            "type": "string",
+            "format": "date"
+          },
+          "done": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "default": []
+    }
+  }
+}

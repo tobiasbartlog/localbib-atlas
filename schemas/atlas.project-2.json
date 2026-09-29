@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.project/2",
+  "title": "Atlas Project Frontmatter",
+  "description": "YAML frontmatter of a project (projekte/*.md). Architektur Abschn. 4.3. Tasks are GFM checklists in the body, not a frontmatter field. v2 adds refs (Paper cite keys, same join mechanism as atlas.idea refs) — see ADR-0003.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "status"],
+  "properties": {
+    "schema": {
+      "const": "atlas.project/2"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["idea", "active", "paused", "done"]
+    },
+    "derived_from": {
+      "type": "array",
+      "description": "Idea and/or dissertation-node IDs this project derives from.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "BibTeX citekeys → join to the LocalBib library.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "due": {
+      "type": "string",
+      "format": "date"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

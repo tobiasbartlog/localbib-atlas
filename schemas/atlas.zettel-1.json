@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.zettel/1",
+  "title": "Atlas Zettel Frontmatter",
+  "description": "YAML frontmatter of a Zettel (zettel/*.md) — the knowledge entity of the Atlas Werkbank (issue #180): Lektuere, Betreuergespraech, Methodik, Entscheidung, Fluechtiges, Rueckblick. Deliberately NOT called 'Notiz' — Notizen are the core's per-paper notes. P5: the title is the only required field. The Markdown body may carry '[[id]]' Verweise to any Atlas entity; the indexer reads them into the edge table, and the reverse direction is the Rueckverweis of the target's detail page. ID = 'YYYY-MM-DD-<slug>' of the title, unique by suffix, immutable and equal to the filename.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title"],
+  "properties": {
+    "schema": {
+      "const": "atlas.zettel/1"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "description": "Kind of knowledge this Zettel holds.",
+      "enum": ["reading", "meeting", "method", "decision", "fleeting", "review"],
+      "default": "fleeting"
+    },
+    "date": {
+      "type": "string",
+      "description": "Day the Zettel belongs to; defaults to the day it was created.",
+      "format": "date"
+    },
+    "refs": {
+      "type": "array",
+      "description": "Literature as Paper cite keys → join to the LocalBib library. Hanging refs are warnings, never auto-repaired.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "promoted_to": {
+      "type": "string",
+      "description": "Id of the Idea this Zettel was developed into. Set by the promote action; the Zettel file stays (P1)."
+    }
+  }
+}
