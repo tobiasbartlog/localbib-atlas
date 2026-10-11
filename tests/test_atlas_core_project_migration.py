@@ -60,7 +60,7 @@ def test_plan_creates_one_research_project_per_core_project():
     assert fgc.status == "active"
     assert fgc.refs == ["Smith2020", "Doe2021"]
     assert fgc.body == "Foerderprojekt."
-    assert "schema: atlas.project/3" in plan.actions[0].content
+    assert "schema: atlas.project/4" in plan.actions[0].content
 
     empty = Project.from_markdown(plan.actions[1].content, id_hint="leseliste")
     assert empty.validate() == []

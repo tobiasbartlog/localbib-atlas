@@ -33,8 +33,10 @@ from plugin_api.testing import InMemoryLibrary, TempSqliteStorage, make_api  # n
 MANIFEST = load_manifest(BUNDLE_ROOT)
 
 
-def build_app(base_dir: Path, *, library: Any = None, llm: Any = None, storage: Any = None):
-    """A FastAPI app hosting a fresh ``AtlasPlugin`` on ``base_dir``."""
+def build_app(base_dir: Path, *, library: Any = None, llm: Any = None, storage: Any = None,
+              settings: Optional[dict] = None):
+    """A FastAPI app hosting a fresh ``AtlasPlugin`` on ``base_dir``;
+    ``settings`` seeds further Add-on settings (e.g. ``own_name``)."""
     from fastapi import FastAPI
 
     import atlas
@@ -45,7 +47,7 @@ def build_app(base_dir: Path, *, library: Any = None, llm: Any = None, storage: 
         library=library if library is not None else InMemoryLibrary(),
         llm=llm,
         storage=storage,
-        settings={"base_dir": str(base_dir)},
+        settings={**(settings or {}), "base_dir": str(base_dir)},
     )
     if llm is False:  # a core without an LLM service: the Add-on must degrade
         api.llm = None
@@ -62,25 +64,30 @@ def build_app(base_dir: Path, *, library: Any = None, llm: Any = None, storage: 
 
     app = FastAPI(lifespan=lifespan)
     app.state.atlas_api = api
+    app.state.atlas_plugin = plugin
     return app
 
 
 @pytest.fixture
 def atlas_app(tmp_path, tmp_path_factory):
-    """Factory: ``with atlas_app(base, library=..., llm=...) as client:``.
+    """Factory: ``with atlas_app(base, library=..., llm=..., settings=...) as client:``.
 
     ``base`` defaults to ``tmp_path``; ``library`` to an empty
     ``InMemoryLibrary``; ``llm`` to the contract's ``DummyLlm`` (``False``:
-    no LLM service at all). The ``PluginApi`` handed to Atlas is
-    ``client.app.state.atlas_api`` — patch its ``llm`` to script answers."""
+    no LLM service at all); ``settings`` seeds Add-on settings next to
+    ``base_dir``. The ``PluginApi`` handed to Atlas is
+    ``client.app.state.atlas_api`` — patch its ``llm`` to script answers,
+    ``settings.set(...)`` to change a setting while Atlas runs."""
     from fastapi.testclient import TestClient
 
     storages: list[TempSqliteStorage] = []
 
-    def _open(base: Optional[Path] = None, *, library: Any = None, llm: Any = None):
+    def _open(base: Optional[Path] = None, *, library: Any = None, llm: Any = None,
+              settings: Optional[dict] = None):
         storage = TempSqliteStorage(tmp_path_factory.mktemp("atlas-storage"))
         storages.append(storage)
-        return TestClient(build_app(base or tmp_path, library=library, llm=llm, storage=storage))
+        return TestClient(build_app(base or tmp_path, library=library, llm=llm, storage=storage,
+                                    settings=settings))
 
     yield _open
     for storage in storages:

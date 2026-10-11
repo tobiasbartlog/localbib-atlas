@@ -43,7 +43,7 @@ def test_publication_minimal_frontmatter_omits_empty_optionals():
     pub = new_publication("Nur Titel")
     fm = pub.to_frontmatter()
     assert fm == {
-        "schema": "atlas.publication/1",
+        "schema": "atlas.publication/2",
         "id": "nur-titel",
         "title": "Nur Titel",
         "status": "planned",
@@ -172,7 +172,7 @@ def test_create_with_only_title_writes_markdown_file(atlas_client, tmp_path):
     md = tmp_path / "veroeffentlichungen" / f"{created['id']}.md"
     assert md.exists()
     text = md.read_text(encoding="utf-8")
-    assert "schema: atlas.publication/1" in text
+    assert "schema: atlas.publication/2" in text
     assert "title: Nur Titel" in text
 
 

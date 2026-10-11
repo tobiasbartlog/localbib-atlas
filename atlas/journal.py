@@ -298,14 +298,16 @@ def _set_marker(raw: str, arrow: str, day: Optional[str]) -> str:
 @dataclass
 class MoveResult:
     """Outcome of an Uebertrag: the marked source body, the target body (the
-    same object when the target day is in the same week) and where the carried
-    Task landed."""
+    same object when the target day is in the same week), where the carried
+    Task landed and where the marked source line sits AFTER the move — inside
+    one week a carry to an earlier day inserts before it, shifting it by one."""
 
     source_body: str
     target_body: str
     target_day: str
     target_index: int
     same_body: bool
+    source_index: int
 
 
 def move_task(
@@ -340,7 +342,74 @@ def move_task(
         target_day=iso,
         target_index=index,
         same_body=same_body,
+        source_index=body_index + (1 if same_body and index <= body_index else 0),
     )
+
+
+class MoveChanged(ValueError):
+    """The two lines of an Uebertrag are no longer what the move wrote — the
+    undo would destroy a later edit, so it is refused."""
+
+
+@dataclass
+class UndoMoveResult:
+    """Outcome of taking an Uebertrag back: both bodies (the same object when
+    one week) and the restored source Task's new ``body_index``."""
+
+    source_body: str
+    target_body: str
+    source_index: int
+    same_body: bool
+
+
+def undo_move(
+    source_body: str,
+    source_index: int,
+    target_index: int,
+    *,
+    target_body: Optional[str] = None,
+) -> UndoMoveResult:
+    """"Übertrag zurücknehmen" (#224): remove the target line (``←``) and the
+    ``→`` marker of the source line — the exact inverse of :func:`move_task`,
+    also across the week boundary (``target_body`` = the other week's body).
+
+    Allowed only while both lines are what the move left: the source still
+    points at the target's day, the target is still open, carries ``←`` the
+    source's day and otherwise the source's text. Anything else raises
+    :class:`MoveChanged`; a missing line raises ``KeyError``. Every other line
+    stays byte-identical (ADR-0020)."""
+    source = find_task(source_body, source_index)
+    if source is None:
+        raise KeyError(f"Kein Task mit body_index {source_index}")
+    same_body = target_body is None
+    t_body = source_body if same_body else target_body
+    target = find_task(t_body, target_index)
+    if target is None:
+        raise KeyError(f"Kein Task mit body_index {target_index}")
+    expected = _set_marker(_set_marker(source["raw"], MOVED_TO, None), MOVED_FROM, source["day"])
+    if (
+        not source["moved_to"]
+        or source["moved_to"] != target["day"]
+        or target["done"]
+        or target["raw"] != expected
+        or (same_body and target["line"] == source["line"])
+    ):
+        raise MoveChanged("Die Zeilen des Uebertrags wurden seither geaendert")
+
+    restored = _rewrite_line(
+        source_body,
+        source_index,
+        lambda m: m.group(1) + m.group(2) + m.group(3) + _set_marker(m.group(4), MOVED_TO, None),
+    )
+    if same_body:
+        lines, trailing = _lines_of(restored)
+        del lines[target["line"]]
+        restored = _body_of(lines, trailing)
+        new_index = source_index - (1 if target_index < source_index else 0)
+        return UndoMoveResult(restored, restored, new_index, True)
+    lines, trailing = _lines_of(target_body)
+    del lines[target["line"]]
+    return UndoMoveResult(restored, _body_of(lines, trailing), source_index, False)
 
 
 def reorder_task(body: str, body_index: int, position: int) -> str:

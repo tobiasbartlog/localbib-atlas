@@ -31,7 +31,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from atlas import agenda, documents, journal_store
-from atlas.journal import MAX_GOALS, goals_progress
+from atlas.journal import MAX_GOALS, MoveChanged, goals_progress
 from atlas.weeks import (
     as_date,
     is_week_id,
@@ -55,6 +55,7 @@ ERR_GOAL_NOT_FOUND = "error.atlas.goal_not_found"
 ERR_GOALS_TOO_MANY = "error.atlas.goals_too_many"
 ERR_GOAL_TITLE_REQUIRED = "error.atlas.goal_title_required"
 ERR_INVALID_REQUEST = "error.atlas.invalid_request"
+ERR_MOVE_CHANGED = "error.atlas.move_changed"
 
 NEWEST_ZETTEL = 5  # how many Zettel the Heute page shows (story 18)
 
@@ -74,6 +75,11 @@ class TaskText(BaseModel):
 
 class TaskMove(BaseModel):
     to: str
+
+
+class TaskUndoMove(BaseModel):
+    to_week: str
+    to_index: int
 
 
 class TaskReorder(BaseModel):
@@ -335,6 +341,7 @@ def build_journal_router(store, broadcaster) -> APIRouter:
                 projects=store.list_projects(),
                 chapters=_chapters(store),
                 ideas=store.list_ideas(),
+                publications=store.list_publications(),
                 today=day,
             ),
             "zettel": [_zettel_row(z) for z in store.list_zettel()[:NEWEST_ZETTEL]],
@@ -403,6 +410,26 @@ def build_journal_router(store, broadcaster) -> APIRouter:
         _week_or_404(week)
         to = _day_or_422(payload.to)
         result = _guard(lambda: store.move_task(week, body_index, to.isoformat()))
+        _changed()
+        return result
+
+    @router.post("/{week}/tasks/{body_index}/undo-move")
+    async def undo_move(week: str, body_index: int, payload: TaskUndoMove):
+        """"Übertrag zurücknehmen" (#224): ``week``/``body_index`` is the
+        source line of the move, ``to_week``/``to_index`` the carried line (the
+        answer of ``/move``). Removes the carried line and the ``→`` marker;
+        refused with ``409 error.atlas.move_changed`` once either line was
+        edited since — the UI then advises moving the Task back instead."""
+        _week_or_404(week)
+        _week_or_404(payload.to_week)
+        try:
+            result = store.undo_move(week, body_index, payload.to_week, payload.to_index)
+        except MoveChanged:
+            raise HTTPException(status_code=409, detail=ERR_MOVE_CHANGED)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=ERR_TASK_NOT_FOUND)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=ERR_INVALID_REQUEST)
         _changed()
         return result
 

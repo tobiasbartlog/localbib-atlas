@@ -344,12 +344,15 @@ def diss_progress(nodes: list["DissNode"]) -> dict:
 
 
 # =============================================================================
-# Research Project entity (ADR-0004, schemas/atlas.project-3.json)
+# Research Project entity (ADR-0004, schemas/atlas.project-4.json)
 # =============================================================================
 # Beware: atlas.project/3 is a DIFFERENT entity than /1|/2 — those are legacy
 # Publications and are converted by the startup migration (atlas/migration.py).
 
-PROJECT_SCHEMA = "atlas.project/3"
+PROJECT_SCHEMA = "atlas.project/4"
+# /4 (ADR-0022, issue #205): optional ``collection_id`` + ``kind`` — the Atlas
+# side of a core Collection. /3 files stay readable (same fields minus the
+# Collection link) and are written as /4 on their next save.
 PROJECT_STATUSES = {"planned", "applied", "active", "finished", "rejected"}
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -490,6 +493,12 @@ class Project:
     milestones: list[dict] = field(default_factory=list)
     body: str = ""
     path: Optional[str] = None
+    # Collection entry (atlas.project/4, ADR-0022): the core Collection whose
+    # Items are this project's literature. ``collection`` is derived at read
+    # time (atlas/collection_entries.py) and never persisted.
+    collection_id: Optional[int] = None
+    kind: Optional[str] = None
+    collection: Optional[dict] = None
 
     @property
     def checklist(self) -> dict:
@@ -522,6 +531,8 @@ class Project:
             refs=[str(r) for r in (fm.get("refs") or [])],
             milestones=[normalize_milestone(m) for m in (fm.get("milestones") or [])],
             body=body.strip("\n"),
+            collection_id=_as_collection_id(fm.get("collection_id")),
+            kind=str(fm["kind"]) if fm.get("kind") else None,
         )
 
     @classmethod
@@ -539,6 +550,7 @@ class Project:
             "title": self.title,
             "status": self.status,
         }
+        _collection_frontmatter(fm, self.collection_id, self.kind)
         if self.start:
             fm["start"] = self.start
         if self.end:
@@ -551,7 +563,9 @@ class Project:
             fm["role"] = self.role
         if self.tags:
             fm["tags"] = list(self.tags)
-        if self.refs:
+        if self.refs and self.collection_id is None:
+            # A Collection entry's literature is the Collection — never a
+            # copy in the file (ADR-0022).
             fm["refs"] = list(self.refs)
         if self.milestones:
             fm["milestones"] = [
@@ -581,15 +595,19 @@ class Project:
             "checklist": cl,
             "sections": self.sections,
             "progress": (cl["done"] / cl["total"]) if cl["total"] else None,
+            "collection_id": self.collection_id,
+            "kind": self.kind,
+            "collection": self.collection,
         }
 
     def validate(self) -> list[str]:
-        """Structural problems (mirrors schemas/atlas.project-3.json). Empty
+        """Structural problems (mirrors schemas/atlas.project-4.json). Empty
         list == valid. Hanging refs need the library — see store.check()."""
         errors: list[str] = []
         fm = self.to_frontmatter()
         if fm["schema"] != PROJECT_SCHEMA:
             errors.append(f"schema muss '{PROJECT_SCHEMA}' sein")
+        errors.extend(_collection_errors(self.collection_id, self.kind, "project"))
         for required in ("id", "title", "status"):
             if not fm.get(required):
                 errors.append(f"Pflichtfeld fehlt: {required}")
@@ -633,14 +651,19 @@ def new_project(title: str, **fields) -> Project:
 
 
 # =============================================================================
-# Publication entity (ADR-0004, schemas/atlas.publication-1.json)
+# Publication entity (ADR-0004, schemas/atlas.publication-2.json)
 # =============================================================================
 
-PUBLICATION_SCHEMA = "atlas.publication/1"
-PUBLICATION_STATUSES = {
-    "planned", "drafting", "submitted", "in-revision",
-    "published", "rejected", "withdrawn",
-}
+PUBLICATION_SCHEMA = "atlas.publication/2"
+# /2 (ADR-0022, issue #205): optional ``collection_id`` + ``kind`` — the Atlas
+# side of a core Collection. /1 files stay readable and are written as /2 on
+# their next save.
+# The one list of a Publication's states, in the Pipeline's order (#225): its
+# five columns, then the two folded away below. pipeline and agenda derive
+# from these, never re-declare them.
+PUBLICATION_PIPELINE_STATUSES = ("planned", "drafting", "submitted", "in-revision", "published")
+PUBLICATION_CLOSED_STATUSES = ("rejected", "withdrawn")
+PUBLICATION_STATUSES = frozenset(PUBLICATION_PIPELINE_STATUSES + PUBLICATION_CLOSED_STATUSES)
 PUBLICATION_TYPES = {"journal-article", "conference-paper", "book-chapter", "other"}
 
 
@@ -670,6 +693,12 @@ class Publication:
     paper: Optional[str] = None
     body: str = ""
     path: Optional[str] = None
+    # Collection entry (atlas.publication/2, ADR-0022): the core Collection
+    # whose Items are this publication's bibliography. ``collection`` is
+    # derived at read time (atlas/collection_entries.py), never persisted.
+    collection_id: Optional[int] = None
+    kind: Optional[str] = None
+    collection: Optional[dict] = None
 
     @property
     def content_hash(self) -> str:
@@ -697,6 +726,8 @@ class Publication:
             projects=list(fm.get("projects") or []),
             paper=fm.get("paper") if fm.get("paper") else None,
             body=body.strip("\n"),
+            collection_id=_as_collection_id(fm.get("collection_id")),
+            kind=str(fm["kind"]) if fm.get("kind") else None,
         )
 
     @classmethod
@@ -714,6 +745,7 @@ class Publication:
             "title": self.title,
             "status": self.status,
         }
+        _collection_frontmatter(fm, self.collection_id, self.kind)
         if self.venue:
             fm["venue"] = self.venue
         if self.type:
@@ -728,7 +760,9 @@ class Publication:
             fm["due"] = self.due
         if self.tags:
             fm["tags"] = list(self.tags)
-        if self.refs:
+        if self.refs and self.collection_id is None:
+            # A Collection entry's bibliography is the Collection — never a
+            # copy in the file (ADR-0022).
             fm["refs"] = list(self.refs)
         if self.derived_from:
             fm["derived_from"] = list(self.derived_from)
@@ -762,15 +796,22 @@ class Publication:
             "paper": self.paper,
             "body": self.body,
             "path": self.path,
+            "collection_id": self.collection_id,
+            "kind": self.kind,
+            "collection": self.collection,
+            # Derived (#225): the body's checklist progress — in the pipeline
+            # the reviewer points of a publication in revision.
+            "checklist": {k: v for k, v in parse_checklist(self.body).items() if k != "items"},
         }
 
     def validate(self) -> list[str]:
-        """Structural problems (mirrors schemas/atlas.publication-1.json). Empty
+        """Structural problems (mirrors schemas/atlas.publication-2.json). Empty
         list == valid. Hanging refs/links need the library/archive — store.check()."""
         errors: list[str] = []
         fm = self.to_frontmatter()
         if fm["schema"] != PUBLICATION_SCHEMA:
             errors.append(f"schema muss '{PUBLICATION_SCHEMA}' sein")
+        errors.extend(_collection_errors(self.collection_id, self.kind, "publication"))
         for required in ("id", "title", "status"):
             if not fm.get(required):
                 errors.append(f"Pflichtfeld fehlt: {required}")
@@ -813,6 +854,32 @@ def publication_from_idea(idea: Idea) -> Publication:
 # =============================================================================
 # helpers
 # =============================================================================
+
+def _as_collection_id(value) -> Optional[int]:
+    """``collection_id`` from frontmatter: a positive int, else None (tolerant
+    parse — a broken value simply makes the file a normal entity)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        cid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cid if cid > 0 else None
+
+
+def _collection_frontmatter(fm: dict, collection_id: Optional[int], kind: Optional[str]) -> None:
+    """Append the Collection link (ADR-0022) right after the core fields."""
+    if collection_id is not None:
+        fm["collection_id"] = collection_id
+        if kind:
+            fm["kind"] = kind
+
+
+def _collection_errors(collection_id: Optional[int], kind: Optional[str], expected: str) -> list[str]:
+    if kind and kind != expected:
+        return [f"kind ungueltig: {kind!r} (in diesem Ordner nur {expected!r})"]
+    return []
+
 
 def _as_int(value) -> int:
     try:

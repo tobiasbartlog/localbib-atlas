@@ -41,10 +41,14 @@ class AtlasPlugin:
         self._store = None
         self._watcher = None
         self._broadcaster = None
+        self._collection_sync = None
+        self._unsubscribe = None
 
     async def activate(self, api: PluginApi) -> None:
         from atlas import config
         from atlas.api import build_router
+        from atlas.collection_entries import CollectionSource
+        from atlas.collection_sync import CollectionSync, reconcile_tombstones
         from atlas.events import EventBroadcaster
         from atlas.migration import (
             migrate_core_projects,
@@ -184,6 +188,26 @@ class AtlasPlugin:
         except RuntimeError:
             pass  # no running loop (e.g. sync activation) — publish() degrades gracefully
 
+        # The core's Collections (ADR-0022, issue #205): read live at every
+        # list/detail (so all of them show up right after installing Atlas),
+        # followed through on_change. A host before contract 2.1 has neither —
+        # Atlas then simply shows no Collection entries.
+        library = getattr(api, "library", None)
+        source = CollectionSource(library)
+        self._store.attach_collections(source)
+        try:
+            reconcile_tombstones(self._store, self._store.collections)
+        except Exception:  # noqa: BLE001 - never block activate; retried on the next event/start
+            logger.exception("Atlas: Abgleich geloeschter Sammlungen fehlgeschlagen")
+        store, broadcaster = self._store, self._broadcaster
+        self._collection_sync = CollectionSync(
+            lambda: reconcile_tombstones(store, store.collections),
+            broadcaster.publish,
+        )
+        subscribe = getattr(library, "on_change", None) if source.available else None
+        if callable(subscribe):
+            self._unsubscribe = subscribe(self._collection_sync.on_event)
+
         self._watcher = IdeaWatcher(
             self._store,
             config.base_dir(),
@@ -207,6 +231,7 @@ class AtlasPlugin:
                 # Host services (Phase 4) — absent on hosts older than the contract.
                 llm=getattr(api, "llm", None),
                 library=getattr(api, "library", None),
+                settings=settings,  # "Dein Name" of the Publikationsliste (#228)
             )
         )
         if self.manifest.nav is not None:
@@ -214,6 +239,16 @@ class AtlasPlugin:
 
     async def deactivate(self) -> None:
         # Stop our own resources; the registry drops nav item + router.
+        # The Collection listener goes first, so no event can arm a new pass.
+        if self._unsubscribe is not None:
+            try:
+                self._unsubscribe()
+            except Exception:  # noqa: BLE001 - deactivate must always finish
+                logger.exception("Atlas: Sammlungs-Listener nicht abgemeldet")
+            self._unsubscribe = None
+        if self._collection_sync is not None:
+            self._collection_sync.close()
+            self._collection_sync = None
         if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None

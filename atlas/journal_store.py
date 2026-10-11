@@ -350,8 +350,26 @@ def move_task(connect: Connect, week: str, body_index: int, to_day) -> dict:
         "day": result.target_day,
         "body_index": result.target_index,
         "source_week": source.week,
-        "source_index": body_index,
+        "source_index": result.source_index,
     }
+
+
+def undo_move(connect: Connect, week: str, body_index: int, to_week: str, to_index: int) -> dict:
+    """"Übertrag zurücknehmen" (#224): the inverse of :func:`move_task` as a
+    line operation on one or both week files (ADR-0020). ``week``/``body_index``
+    is the source line, ``to_week``/``to_index`` the carried one."""
+    source = read_journal(ensure_week(week))
+    same_week = ensure_week(to_week) == source.week
+    target = source if same_week else read_journal(to_week)
+    result = journal_mod.undo_move(
+        source.body, body_index, to_index, target_body=None if same_week else target.body
+    )
+    source.body = result.source_body
+    _persist(connect, source)
+    if not same_week:
+        target.body = result.target_body
+        _persist(connect, target)
+    return {"week": source.week, "body_index": result.source_index}
 
 
 def set_goals(connect: Connect, week: str, goals: Iterable) -> Journal:

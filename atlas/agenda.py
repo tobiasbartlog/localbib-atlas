@@ -16,14 +16,19 @@ import re
 from datetime import date, timedelta
 from typing import Iterable, Optional
 
-from atlas.domain import annotate_milestones
+from atlas.domain import PUBLICATION_CLOSED_STATUSES, annotate_milestones
 from atlas.journal import goal_progress
 from atlas.weeks import as_date, today_or, week_contains, week_dates
 
 # Thresholds — constants, not settings.
-DUE_SOON_DAYS = 7        # milestones due within a week (or already overdue)
+DUE_SOON_DAYS = 14       # milestones and deadlines due within two weeks (or overdue)
 CHAPTER_STALE_DAYS = 21  # a Kapitel untouched this long has stalled
 IDEA_SEED_STALE_DAYS = 60  # an Idee sitting in status seed this long
+SUBMITTED_NUDGE_DAYS = 56  # eight weeks "Eingereicht" -> ask the journal (#223)
+
+# A Publication in one of these states has no open deadline any more: it is
+# published, or folded away below the Pipeline (domain's closed states).
+CLOSED_PUBLICATION_STATUSES = frozenset({"published", *PUBLICATION_CLOSED_STATUSES})
 
 _ID_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
@@ -63,6 +68,7 @@ def whats_due(
     projects: Iterable = (),
     chapters: Iterable = (),
     ideas: Iterable = (),
+    publications: Iterable = (),
     today: Optional[date] = None,
 ) -> dict:
     """"Was liegt an" over already-loaded Atlas data.
@@ -72,6 +78,10 @@ def whats_due(
     - ``stale_chapters``: Kapitel unchanged for :data:`CHAPTER_STALE_DAYS`
       (``modified_at`` — the file mtime, supplied by the caller).
     - ``stale_ideas``: Ideen in status ``seed`` for :data:`IDEA_SEED_STALE_DAYS`.
+    - ``deadlines``: Veroeffentlichungen whose ``due`` is overdue or within
+      :data:`DUE_SOON_DAYS`, unless published/rejected/withdrawn (#223).
+    - ``follow_ups``: Veroeffentlichungen in ``submitted`` for more than
+      :data:`SUBMITTED_NUDGE_DAYS` days ("nachfragen?", #223).
 
     Every entry carries ``days`` — negative = overdue / days in the past.
     """
@@ -143,10 +153,47 @@ def whats_due(
             )
     stale_ideas.sort(key=lambda i: i["days"])
 
+    deadlines: list[dict] = []
+    follow_ups: list[dict] = []
+    for pub in publications:
+        status = str(_field(pub, "status") or "")
+        if status in CLOSED_PUBLICATION_STATUSES:
+            continue
+        due = _as_day(_field(pub, "due"))
+        if due is not None and due <= horizon:
+            deadlines.append(
+                {
+                    "id": _field(pub, "id"),
+                    "title": _field(pub, "title"),
+                    "status": status,
+                    "venue": _field(pub, "venue"),
+                    "date": due.isoformat(),
+                    "state": "overdue" if due < now else "upcoming",
+                    "days": (due - now).days,
+                }
+            )
+        submitted = _as_day(_field(pub, "submitted"))
+        if status == "submitted" and submitted is not None:
+            waiting = (now - submitted).days
+            if waiting > SUBMITTED_NUDGE_DAYS:
+                follow_ups.append(
+                    {
+                        "id": _field(pub, "id"),
+                        "title": _field(pub, "title"),
+                        "venue": _field(pub, "venue"),
+                        "submitted": submitted.isoformat(),
+                        "days": -waiting,
+                    }
+                )
+    deadlines.sort(key=lambda d: (d["date"], str(d["id"])))
+    follow_ups.sort(key=lambda f: f["days"])
+
     return {
         "milestones": milestones,
         "stale_chapters": stale_chapters,
         "stale_ideas": stale_ideas,
+        "deadlines": deadlines,
+        "follow_ups": follow_ups,
     }
 
 

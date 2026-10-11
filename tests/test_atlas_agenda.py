@@ -86,7 +86,8 @@ def test_an_explicit_created_field_beats_the_id_prefix():
 
 def test_whats_due_without_data_is_empty_but_shaped():
     assert whats_due(today=TODAY) == {
-        "milestones": [], "stale_chapters": [], "stale_ideas": []
+        "milestones": [], "stale_chapters": [], "stale_ideas": [],
+        "deadlines": [], "follow_ups": [],
     }
 
 

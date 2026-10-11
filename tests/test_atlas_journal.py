@@ -238,6 +238,24 @@ def test_move_inside_the_same_week_marks_the_source_and_appends_the_target():
     assert target["open"] is True
 
 
+def test_move_names_where_the_source_line_sits_afterwards():
+    # A later day: the carried line lands after the source, which keeps its index.
+    later = move_task(BODY, 0, "2026-09-22")
+    assert later.source_index == 0
+    assert find_task(later.source_body, later.source_index)["moved_to"] == "2026-09-22"
+    # An earlier day of the same week: the carried line is inserted before the
+    # source, so the source moves one index down — the undo must address that.
+    earlier = move_task(BODY, 2, "2026-09-21")
+    assert earlier.target_index == 2
+    assert earlier.source_index == 3
+    source = find_task(earlier.source_body, earlier.source_index)
+    assert source["text"].startswith("Methodik ausbauen")
+    assert source["moved_to"] == "2026-09-21"
+    # Another week: the source body gets no new line.
+    other = move_task(BODY, 3, "2026-09-28", target_body="## Montag 2026-09-28\n")
+    assert other.source_index == 3
+
+
 def test_move_leaves_all_other_lines_byte_identical():
     result = move_task(BODY, 1, "2026-09-22")
     before, after = lines(BODY), lines(result.target_body)

@@ -1,7 +1,7 @@
 {
   "id": "atlas",
   "name": "Atlas",
-  "version": "0.3.0",
+  "version": "0.5.3",
   "author": "LocalBib",
   "license": "AGPL-3.0-only",
   "tagline": "Ideen, Veröffentlichungen, Projekte, Dissertation und Werkbank.",
@@ -13,7 +13,8 @@
   "python": "any",
   "permissions": ["library.read", "llm", "settings.core", "network", "files", "storage"],
   "settings": [
-    {"key": "base_dir", "type": "path", "label": "atlas.settings.base_dir", "default": ""}
+    {"key": "base_dir", "type": "path", "label": "atlas.settings.base_dir", "default": ""},
+    {"key": "own_name", "type": "string", "label": "atlas.settings.own_name", "default": ""}
   ],
   "frontend": {
     "script": "frontend/atlas.js",

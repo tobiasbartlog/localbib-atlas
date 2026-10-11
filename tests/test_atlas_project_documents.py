@@ -7,6 +7,7 @@ indexer must never scan these subfolders for Markdown.
 from __future__ import annotations
 
 import json
+from datetime import date
 from unittest.mock import patch
 
 import fitz
@@ -41,6 +42,34 @@ def _write_pdf(path, text: str = ""):
         page.insert_text((72, 72), text)
     doc.save(path)
     doc.close()
+
+
+# --- deleting the project ----------------------------------------------------------
+
+def test_deleting_the_project_sets_its_documents_aside(atlas_client, project_id, tmp_path, monkeypatch):
+    """Same rule as a Publication's folder (#226 review): the files stay, but
+    a new project with the same id does not inherit them."""
+    from atlas import documents
+
+    monkeypatch.setattr(documents, "_today", lambda: date(2026, 10, 10))
+    today = "2026-10-10"
+    _upload(atlas_client, project_id)
+    assert atlas_client.delete(f"/api/plugins/atlas/projects/{project_id}").status_code == 200
+    assert not (tmp_path / "projekte" / project_id).exists()
+    assert (tmp_path / "projekte" / f"{project_id}.geloescht-{today}" / "bericht.pdf").is_file()
+    again = atlas_client.post("/api/plugins/atlas/projects", json={"title": "FGC Robotik"}).json()["id"]
+    assert again == project_id
+    assert atlas_client.get(f"/api/plugins/atlas/projects/{project_id}/documents").json() == {"documents": []}
+
+
+def test_a_leftover_folder_is_never_inherited_by_a_new_project(atlas_client, tmp_path):
+    leftover = tmp_path / "projekte" / "dfg-antrag"
+    leftover.mkdir(parents=True)
+    (leftover / "alt.pdf").write_bytes(b"%PDF-1.4")
+    new_id = atlas_client.post("/api/plugins/atlas/projects", json={"title": "DFG Antrag"}).json()["id"]
+    assert new_id == "dfg-antrag-2"
+    assert atlas_client.get(f"/api/plugins/atlas/projects/{new_id}/documents").json() == {"documents": []}
+    assert (leftover / "alt.pdf").is_file()
 
 
 # --- listing -------------------------------------------------------------------

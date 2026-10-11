@@ -186,6 +186,79 @@ def test_move_marks_the_source_and_appends_the_target(atlas_client, tmp_path):
     assert "## Freitag 2026-09-25" in text
 
 
+# --- Übertrag zurücknehmen (#224) ----------------------------------------------
+
+def _undo(client, moved: dict):
+    return client.post(
+        f"{BASE}/{moved['source_week']}/tasks/{moved['source_index']}/undo-move",
+        json={"to_week": moved["week"], "to_index": moved["body_index"]},
+    )
+
+
+def test_undo_move_restores_the_file_byte_for_byte_in_the_same_week(atlas_client, tmp_path):
+    add_task(atlas_client, "Vorher", day=MONDAY)
+    add_task(atlas_client, "Mail an Betreuer #mail", day=WEDNESDAY)
+    add_task(atlas_client, "Danach", day=WEDNESDAY)
+    before = journal_text(tmp_path)
+
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/1/move", json={"to": FRIDAY}).json()
+    assert journal_text(tmp_path) != before
+    resp = _undo(atlas_client, moved)
+    assert resp.status_code == 200
+    assert resp.json() == {"week": WEEK, "body_index": 1}
+    after = journal_text(tmp_path)
+    removed, added = line_diff(before, after)
+    # Only the (now empty) Friday heading the move created may remain.
+    assert removed == [] and all(a.startswith("## Freitag") or a == "" for a in added)
+    assert "- [ ] Mail an Betreuer #mail" in after and "→" not in after and "←" not in after
+
+
+def test_undo_move_to_an_earlier_day_keeps_the_source_addressable(atlas_client, tmp_path):
+    add_task(atlas_client, "Spaeter", day=FRIDAY)
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/0/move", json={"to": MONDAY}).json()
+    assert moved["body_index"] == 0  # the carried line sits before the source
+    assert moved["source_index"] == 1  # ... so the source moved one index down
+    resp = _undo(atlas_client, moved)
+    assert resp.json() == {"week": WEEK, "body_index": 0}
+    week = atlas_client.get(f"{BASE}/{WEEK}").json()
+    assert [(t["text"], t["day"], t["open"]) for t in week["tasks"]] == [("Spaeter", FRIDAY, True)]
+
+
+def test_undo_move_across_the_week_boundary_writes_both_files(atlas_client, tmp_path):
+    add_task(atlas_client, "Kapitel schreiben", day=FRIDAY)
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/0/move", json={"to": NEXT_MONDAY}).json()
+    assert _undo(atlas_client, moved).status_code == 200
+    assert "- [ ] Kapitel schreiben\n" in journal_text(tmp_path) + "\n"
+    assert "→" not in journal_text(tmp_path)
+    assert "Kapitel schreiben" not in journal_text(tmp_path, NEXT_WEEK)
+    today = atlas_client.get(f"{BASE}/{WEEK}").json()
+    assert [t["open"] for t in today["tasks"]] == [True]
+
+
+def test_undo_move_is_refused_once_a_line_was_changed(atlas_client, tmp_path):
+    add_task(atlas_client, "Mail an Betreuer", day=WEDNESDAY)
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/0/move", json={"to": FRIDAY}).json()
+    # The carried line is ticked off meanwhile.
+    atlas_client.post(f"{BASE}/{WEEK}/tasks/{moved['body_index']}/toggle")
+    before = journal_text(tmp_path)
+    resp = _undo(atlas_client, moved)
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "error.atlas.move_changed"
+    assert journal_text(tmp_path) == before
+
+    add_task(atlas_client, "Zweite", day=WEDNESDAY)
+    second = atlas_client.post(f"{BASE}/{WEEK}/tasks/1/move", json={"to": FRIDAY}).json()
+    atlas_client.put(f"{BASE}/{WEEK}/tasks/{second['body_index']}", json={"text": "Zweite, geaendert ←2026-09-23"})
+    assert _undo(atlas_client, second).status_code == 409
+
+
+def test_undo_move_of_a_line_that_is_gone_is_404(atlas_client):
+    add_task(atlas_client, "Mail", day=WEDNESDAY)
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/0/move", json={"to": FRIDAY}).json()
+    atlas_client.delete(f"{BASE}/{WEEK}/tasks/{moved['body_index']}")
+    assert _undo(atlas_client, moved).status_code == 404
+
+
 def test_move_across_the_week_boundary_creates_the_second_file(atlas_client, tmp_path):
     add_task(atlas_client, "Kapitel schreiben", day=FRIDAY)
 
@@ -272,6 +345,42 @@ def test_today_shows_whats_due_from_a_milestone_and_a_stale_chapter(atlas_client
     assert [m["title"] for m in due["milestones"]] == ["Zwischenbericht"]
     assert due["milestones"][0]["project_title"] == "DFG-Projekt"
     assert [c["id"] for c in due["stale_chapters"]] == [chapter["id"]]
+
+
+def test_today_lists_publication_deadlines_overdue_and_within_two_weeks(atlas_client):
+    """#223: a Frist (`due`) of an open Veroeffentlichung is "was liegt an" when
+    it is overdue or within 14 days; a closed status or a far date is not."""
+    pubs = "/api/plugins/atlas/publications"
+    atlas_client.post(pubs, json={"title": "Abstract", "status": "drafting", "due": FRIDAY})
+    atlas_client.post(pubs, json={"title": "Revision", "status": "in-revision", "due": MONDAY})
+    atlas_client.post(pubs, json={"title": "Zu weit", "status": "planned", "due": "2026-10-08"})
+    atlas_client.post(pubs, json={"title": "Grenze", "status": "planned", "due": "2026-10-07"})
+    atlas_client.post(pubs, json={"title": "Fertig", "status": "published", "due": MONDAY})
+    atlas_client.post(pubs, json={"title": "Abgelehnt", "status": "rejected", "due": FRIDAY})
+    atlas_client.post(pubs, json={"title": "Ohne Frist", "status": "drafting"})
+
+    due = atlas_client.get(f"{BASE}/today").json()["due"]
+    assert [d["title"] for d in due["deadlines"]] == ["Revision", "Abstract", "Grenze"]
+    assert [d["state"] for d in due["deadlines"]] == ["overdue", "upcoming", "upcoming"]
+    assert [d["days"] for d in due["deadlines"]] == [-2, 2, 14]
+
+
+def test_today_nudges_publications_submitted_more_than_eight_weeks_ago(atlas_client):
+    """#223: more than 56 days in `submitted` -> "nachfragen?"; exactly 56 days
+    is not yet, and another status never is."""
+    pubs = "/api/plugins/atlas/publications"
+    atlas_client.post(pubs, json={"title": "Lange", "status": "submitted",
+                                  "submitted": "2026-07-28", "venue": "J. Test"})   # 57 Tage
+    atlas_client.post(pubs, json={"title": "Genau", "status": "submitted",
+                                  "submitted": "2026-07-29"})                      # 56 Tage
+    atlas_client.post(pubs, json={"title": "Revision", "status": "in-revision",
+                                  "submitted": "2026-01-01"})
+    atlas_client.post(pubs, json={"title": "Ohne Datum", "status": "submitted"})
+
+    due = atlas_client.get(f"{BASE}/today").json()["due"]
+    assert [f["title"] for f in due["follow_ups"]] == ["Lange"]
+    assert due["follow_ups"][0]["days"] == -57
+    assert due["follow_ups"][0]["venue"] == "J. Test"
 
 
 def test_today_lists_the_newest_zettel(atlas_client):

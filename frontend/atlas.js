@@ -130,15 +130,19 @@ function mergeProjectBodyExtraction(currentBody, workpackageMarkdown) {
 }
 if (typeof window !== 'undefined') window._mergeProjectBodyExtraction = mergeProjectBodyExtraction;
 
-// Veroeffentlichungen (atlas.publication/1, ADR-0004)
+// Veroeffentlichungen (atlas.publication/2, ADR-0004). Die EINE Liste der
+// Status- und Typ-Bezeichnungen — in der Wortwahl des Redesigns (#220:
+// Schreiben, Überarbeiten, Konferenzbeitrag); Pipeline, Detailseite und die
+// alten Ansichten lesen alle hieraus (ATLAS_PUBLICATION_*_LABEL unten).
 const PUBLICATION_STATUSES = [
     { key: 'planned', label: 'Geplant' },
-    { key: 'drafting', label: 'Entwurf' },
+    { key: 'drafting', label: 'Schreiben' },
     { key: 'submitted', label: 'Eingereicht' },
-    { key: 'in-revision', label: 'In Revision' },
+    { key: 'in-revision', label: 'Überarbeiten' },
     { key: 'published', label: 'Veröffentlicht' },
-    { key: 'rejected', label: 'Abgelehnt' },
-    { key: 'withdrawn', label: 'Zurückgezogen' },
+    // `closed`: eingeklappt unter der Pipeline, keine offene Frist mehr.
+    { key: 'rejected', label: 'Abgelehnt', closed: true },
+    { key: 'withdrawn', label: 'Zurückgezogen', closed: true },
 ];
 
 const PUBLICATION_STATUS_CLASS = {
@@ -153,7 +157,7 @@ const PUBLICATION_STATUS_CLASS = {
 
 const PUBLICATION_TYPES = [
     { key: 'journal-article', label: 'Journal-Artikel' },
-    { key: 'conference-paper', label: 'Konferenz-Paper' },
+    { key: 'conference-paper', label: 'Konferenzbeitrag' },
     { key: 'book-chapter', label: 'Buchkapitel' },
     { key: 'other', label: 'Sonstiges' },
 ];
@@ -645,7 +649,8 @@ const atlasWork = reactive({
 async function atlasRefreshToday() {
     try {
         const data = await api('/api/plugins/atlas/journal/today');
-        atlasWork.openCount = data.open_count || 0;
+        // Das Abzeichen am Kalender zählt die offenen Aufgaben von heute (#223).
+        atlasWork.openCount = (data.tasks || []).filter((t) => t.open).length;
         atlasWork.today = data.date || '';
         atlasWork.week = data.week || '';
         return data;
@@ -673,7 +678,7 @@ const ATLAS_KIND_LABEL = {
     diss_node: 'Kapitel',
     project: 'Projekt',
     publication: 'Veröff.',
-    zettel: 'Zettel',
+    zettel: 'Notiz',
 };
 
 // Die Sammlung liegt seit #180 unter /atlas/sammlung; welcher Tab und welche
@@ -710,6 +715,7 @@ function atlasEntityHref(id) {
 function atlasEntityRoute(entity) {
     if (!entity) return null;
     if (entity.kind === 'zettel') return '/atlas/zettel/' + encodeURIComponent(entity.id);
+    if (entity.kind === 'publication') return atlasPublicationRoute(entity.id);
     const map = ATLAS_KIND_QUERY[entity.kind];
     if (!map) return null;
     const query = { tab: map.tab };
@@ -766,49 +772,678 @@ function atlasConnectEvents(onKind) {
     return es;
 }
 
-// Navigation in zwei Gruppen (Story 56). Die aktive Seite sagt selbst, welcher
-// Eintrag leuchtet (`active`) — verlässlicher als Pfade zu vergleichen, weil
-// die Sammlung ihren Bereich in der Query trägt.
-const ATLAS_NAV_GROUPS = [
-    {
-        label: 'Arbeit',
-        items: [
-            { key: 'heute', label: 'Heute', to: '/atlas', badge: true },
-            { key: 'woche', label: 'Woche', to: '/atlas/woche' },
-            { key: 'rueckblick', label: 'Rückblick', to: '/atlas/rueckblick' },
-        ],
+// Ältere Endpunkte melden nur einen `type`; er sagt dieselbe Art.
+const ATLAS_EVENT_TYPE_KIND = {
+    'ideas-changed': 'idea',
+    'diss-changed': 'diss_node',
+    'projects-changed': 'project',
+    'publications-changed': 'publication',
+    'manuscripts-changed': 'manuscript',
+};
+
+// Stilles Nachladen für Seiten (#226-Review). Eine Aktion meldet sich doppelt
+// (API und Watcher), ein OneDrive-Sync in Schüben: die Arten werden gesammelt,
+// `quiet` ms nach dem letzten Ereignis (spätestens `maxWait` nach dem ersten)
+// ruft `reload(kinds)` EINMAL — nie zwei Läufe zugleich; was während eines
+// Laufs kommt, folgt danach in genau einem. Die Seite lädt mit
+// `atlasTouches(kinds, …)` nur, was die gemeldeten Arten betreffen.
+function atlasLiveReload(reload, { quiet = 300, maxWait = 1500 } = {}) {
+    let pending = new Set();
+    let timer = null;
+    let first = 0;
+    let running = false;
+    let closed = false;
+    const schedule = () => {
+        if (closed) return;
+        const now = Date.now();
+        if (!first) first = now;
+        clearTimeout(timer);
+        timer = setTimeout(fire, Math.max(0, Math.min(quiet, first + maxWait - now)));
+    };
+    const fire = async () => {
+        timer = null;
+        if (running || closed) return;  // läuft schon: danach geht es weiter
+        const kinds = pending;
+        pending = new Set();
+        first = 0;
+        running = true;
+        try { await reload(kinds); } catch (e) { /* still: der nächste Ping holt es nach */ }
+        running = false;
+        if (pending.size) schedule();
+    };
+    const es = atlasConnectEvents((kind, type) => {
+        pending.add(kind || ATLAS_EVENT_TYPE_KIND[type] || 'archive');
+        schedule();
+    });
+    return {
+        close() {
+            closed = true;
+            clearTimeout(timer);
+            timer = null;
+            if (es) es.close();
+        },
+    };
+}
+
+// Betrifft eine Menge gemeldeter Arten diese Teile? `null` (erstes Laden) und
+// die unbestimmte Art `archive` (Reindex, fremde Datei) betreffen alles.
+function atlasTouches(kinds, wanted) {
+    return !kinds || kinds.has('archive') || wanted.some((k) => kinds.has(k));
+}
+
+// ── Atlas neu (#223): fünf Bereiche, Kopf, „Neu anlegen", Hinweise ──────────
+// Die Navigation hat fünf Bereiche (Übersicht, Kalender, Schreiben, Ideen &
+// Notizen, Projekte); „Schreiben" und „Ideen & Notizen" tragen eine
+// Unternavigation. Die Seiten sagen weiter mit ihrem alten Schlüssel, wo sie
+// stehen (`active="zettel"`); welcher Bereich daraus leuchtet, steht hier —
+// einmal, statt auf jeder Seite.
+
+// Die Icons der Design-Vorlage (docs/design_handoff_atlas_ui_redesign/), als
+// innere SVG-Formen. Gezeichnet wird mit `currentColor`, die Farbe kommt also
+// immer aus einem `--lb-*`-Token des umgebenden Elements.
+const ATLAS_ICON_PATHS = {
+    grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect>',
+    calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
+    pen: '<path d="M4 20h4L19 9l-4-4L4 16v4z"></path><path d="M13.5 6.5l4 4"></path>',
+    bulb: '<path d="M9 18h6M10 21h4"></path><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"></path>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>',
+    plus: '<path d="M12 5v14M5 12h14"></path>',
+    search: '<circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path>',
+    task: '<rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="M8.5 12.5l2.5 2.5 5-6"></path>',
+    note: '<path d="M6 3h12v18H6z"></path><path d="M9 7h6M9 11h6M9 15h3"></path>',
+    book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5z"></path><path d="M4 19a2 2 0 0 1 2-2h13"></path>',
+    doc: '<path d="M6 3h9l4 4v14H6z"></path><path d="M14 3v5h5M9 13h7M9 17h5"></path>',
+    close: '<path d="M6 6l12 12M18 6L6 18"></path>',
+    alert: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v6M12 16.5v.5"></path>',
+    flag: '<path d="M5 21V4M5 4h11l-2 4 2 4H5"></path>',
+    clock: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>',
+    arrow: '<path d="M5 12h14M13 6l6 6-6 6"></path>',
+    back: '<path d="M19 12H5M11 6l-6 6 6 6"></path>',
+    check: '<path d="M5 12.5l4.5 4.5L19 7.5"></path>',
+    chevronLeft: '<path d="M15 6l-6 6 6 6"></path>',
+    chevronRight: '<path d="M9 6l6 6-6 6"></path>',
+    undo: '<path d="M9 14L4 9l5-5"></path><path d="M4 9h10a6 6 0 0 1 0 12h-3"></path>',
+    upload: '<path d="M12 16V4M7 9l5-5 5 5"></path><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"></path>',
+    external: '<path d="M14 4h6v6M20 4l-9 9"></path><path d="M18 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"></path>',
+    copy: '<rect x="8" y="8" width="13" height="13" rx="2"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path>',
+    download: '<path d="M12 4v12M7 11l5 5 5-5"></path><path d="M4 20h16"></path>',
+    paste: '<rect x="6" y="4" width="12" height="17" rx="2"></rect><path d="M9 4V3h6v1M9 10h6M9 14h6"></path>',
+    link: '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"></path><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"></path>',
+    list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"></path>',
+    stack: '<path d="M12 3l9 5-9 5-9-5 9-5z"></path><path d="M3 13l9 5 9-5"></path>',
+    grip: '<circle cx="9" cy="6" r="1.6"></circle><circle cx="15" cy="6" r="1.6"></circle><circle cx="9" cy="12" r="1.6"></circle><circle cx="15" cy="12" r="1.6"></circle><circle cx="9" cy="18" r="1.6"></circle><circle cx="15" cy="18" r="1.6"></circle>',
+};
+
+const AtlasIcon = {
+    props: {
+        name: { type: String, required: true },
+        size: { type: [Number, String], default: 18 },
     },
+    template: `<svg class="atlas-ico" :class="{ 'is-filled': name === 'grip' }" :width="size" :height="size"
+                    viewBox="0 0 24 24" aria-hidden="true" focusable="false" v-html="paths"></svg>`,
+    computed: {
+        paths() { return ATLAS_ICON_PATHS[this.name] || ''; },
+    },
+};
+
+// Gemeinsamer Oberflächen-Zustand: der „Neu anlegen"-Dialog und der eine
+// Hinweis (Toast) mit optionalem „Rückgängig". Beides hängt an der
+// Navigation, die jede Atlas-Seite trägt — eine Seite ruft nur
+// `atlasOpenNew()` bzw. `atlasToast()`.
+const atlasUi = reactive({
+    newOpen: false,
+    newType: 'task',
+    newDay: '',
+    newLinks: [],
+    toast: null,
+});
+
+let atlasToastTimer = null;
+
+// Ein Hinweis unten am Rand. `opts.action` ist eine (asynchrone) Funktion, die
+// der Knopf `opts.actionLabel` ausführt — so läuft jedes „Rückgängig".
+// `opts.link` ({label, to}) ist ein Weg dorthin, wo es weitergeht (z. B.
+// „DOI eintragen" → Publikationsliste, #228), vor dem Knopf.
+function atlasToast(message, opts = {}) {
+    if (atlasToastTimer) clearTimeout(atlasToastTimer);
+    atlasUi.toast = {
+        id: Date.now() + Math.random(),
+        message,
+        actionLabel: opts.actionLabel || '',
+        action: opts.action || null,
+        link: opts.link || null,
+        tone: opts.tone || '',
+    };
+    atlasToastTimer = setTimeout(() => {
+        atlasUi.toast = null;
+        atlasToastTimer = null;
+    }, opts.timeout || 10000);
+}
+
+// `opts.day` setzt den Tag einer Aufgabe, `opts.links` verknüpft vorab
+// ([{id, kind, title}]) — z. B. „Aufgabe zu diesem Beitrag".
+function atlasOpenNew(type = 'task', opts = {}) {
+    atlasUi.newType = type;
+    atlasUi.newDay = opts.day || '';
+    atlasUi.newLinks = opts.links || [];
+    atlasUi.newOpen = true;
+}
+
+// Die Adresse der Veröffentlichungen: die Pipeline (#225).
+const ATLAS_PUBLICATIONS_ROUTE = '/atlas/veroeffentlichungen';
+// Die Publikationsliste (#228) — eine eigene Adresse neben der Pipeline, nicht
+// unter /veroeffentlichungen/:id (eine Veröffentlichung darf „liste" heißen).
+const ATLAS_PUBLICATION_LIST_ROUTE = '/atlas/publikationsliste';
+
+// `pubId` wählt die Veröffentlichung in „Eigenes Paper per DOI verknüpfen" vor.
+function atlasPublicationListRoute(pubId) {
+    return pubId ? { path: ATLAS_PUBLICATION_LIST_ROUTE, query: { verknuepfen: pubId } } : ATLAS_PUBLICATION_LIST_ROUTE;
+}
+
+// Der Import des Kerns mit einer DOI-Liste (#227, stabil laut
+// plugin_api/AUTHORING.md): ein `dois=` je DOI — Komma und Semikolon kommen
+// in echten DOIs vor —, `collection` wählt eine Zielsammlung vor. Angelegt
+// wird erst nach Bestätigung im Kern; Atlas ruft keinen schreibenden
+// Kern-Endpunkt (P2).
+function atlasImportRoute(dois, collectionId) {
+    const query = { dois: [...dois] };
+    if (collectionId !== null && collectionId !== undefined) query.collection = String(collectionId);
+    return { path: '/import', query };
+}
+
+const ATLAS_AREAS = [
+    { key: 'uebersicht', label: 'Übersicht', icon: 'grid', to: '/atlas' },
+    { key: 'kalender', label: 'Kalender', icon: 'calendar', to: '/atlas/woche', badge: true },
     {
-        label: 'Sammlung',
-        items: [
-            { key: 'kapitel', label: 'Kapitel', to: '/atlas/sammlung?tab=dissertation' },
-            { key: 'zettel', label: 'Zettel', to: '/atlas/zettel' },
-            { key: 'ideen', label: 'Ideen', to: '/atlas/sammlung?tab=ideen' },
-            { key: 'veroeffentlichungen', label: 'Veröffentlichungen', to: '/atlas/sammlung?tab=veroeffentlichungen' },
-            { key: 'projekte', label: 'Projekte', to: '/atlas/sammlung?tab=projekte' },
+        key: 'schreiben', label: 'Schreiben', icon: 'pen', to: '/atlas/sammlung?tab=dissertation',
+        sub: [
+            { key: 'kapitel', label: 'Dissertation', to: '/atlas/sammlung?tab=dissertation' },
+            { key: 'veroeffentlichungen', label: 'Veröffentlichungen', to: ATLAS_PUBLICATIONS_ROUTE },
             { key: 'manuskripte', label: 'Manuskripte', to: '/atlas/sammlung?tab=veroeffentlichungen&focus=manuskripte' },
         ],
     },
+    {
+        key: 'ideen-notizen', label: 'Ideen & Notizen', icon: 'bulb', to: '/atlas/sammlung?tab=ideen',
+        sub: [
+            { key: 'ideen', label: 'Ideen', to: '/atlas/sammlung?tab=ideen' },
+            { key: 'zettel', label: 'Notizen', to: '/atlas/zettel' },
+        ],
+    },
+    { key: 'projekte', label: 'Projekte', icon: 'folder', to: '/atlas/sammlung?tab=projekte' },
 ];
 
-const AtlasNav = {
-    props: { active: { type: String, default: '' } },
+// Seitenschlüssel → Bereich. Die Schlüssel sind die bisherigen der
+// Werkbank-Navigation, damit keine Seite ihren Namen ändern muss.
+const ATLAS_NAV_AREA = {
+    heute: 'uebersicht',
+    woche: 'kalender',
+    rueckblick: 'kalender',
+    kapitel: 'schreiben',
+    veroeffentlichungen: 'schreiben',
+    manuskripte: 'schreiben',
+    ideen: 'ideen-notizen',
+    zettel: 'ideen-notizen',
+    projekte: 'projekte',
+};
+
+function atlasAreaOf(key) {
+    const areaKey = ATLAS_NAV_AREA[key] || key;
+    return ATLAS_AREAS.find((a) => a.key === areaKey) || null;
+}
+
+// ISO-Datum (YYYY-MM-DD) eines lokalen Date — nie über toISOString, das in
+// UTC rechnet und abends einen Tag daneben liegt.
+function atlasIso(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+        + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function atlasAddDays(iso, n) {
+    const d = atlasDate(iso);
+    if (!d) return '';
+    d.setDate(d.getDate() + n);
+    return atlasIso(d);
+}
+
+// „Nächste Woche" bzw. „Montag" = der Montag der Folgewoche (#220).
+function atlasNextMonday(iso) {
+    const d = atlasDate(iso);
+    if (!d) return '';
+    const weekday = (d.getDay() + 6) % 7;   // Mo = 0
+    return atlasAddDays(iso, 7 - weekday);
+}
+
+// „in 4 Tagen", „heute", „morgen", „seit 3 Tagen" — die Abstände der Übersicht.
+function atlasInDays(days) {
+    const n = Number(days) || 0;
+    if (n === 0) return 'heute';
+    if (n === 1) return 'morgen';
+    if (n === -1) return 'seit gestern';
+    if (n < 0) return 'seit ' + (-n) + ' Tagen';
+    return 'in ' + n + ' Tagen';
+}
+
+const AtlasToast = {
     template: `
-        <nav class="atlas-nav" aria-label="Atlas">
-            <div v-for="group in groups" :key="group.label" class="atlas-nav-group">
-                <span class="atlas-nav-kicker">{{ group.label }}</span>
-                <router-link v-for="item in group.items" :key="item.key" :to="item.to"
-                             class="atlas-nav-item" :class="{ 'is-active': active === item.key }"
-                             :aria-current="active === item.key ? 'page' : null">
-                    {{ item.label }}
-                    <span v-if="item.badge && openCount" class="atlas-nav-badge"
-                          :title="openCount + ' offene Tasks'">{{ openCount }}</span>
-                </router-link>
+        <div class="atlas-toast-wrap" role="status" aria-live="polite">
+            <div v-if="toast" :key="toast.id" class="atlas-toast" :class="toast.tone ? 'is-' + toast.tone : ''">
+                <span class="atlas-toast-msg">{{ toast.message }}</span>
+                <router-link v-if="toast.link" :to="toast.link.to" class="atlas-toast-link" @click="close">{{ toast.link.label }}</router-link>
+                <button v-if="toast.action" type="button" class="atlas-toast-action" @click="run">{{ toast.actionLabel }}</button>
+                <button type="button" class="atlas-toast-close" aria-label="Hinweis schließen" @click="close">×</button>
             </div>
-        </nav>
+        </div>
     `,
     computed: {
-        groups() { return ATLAS_NAV_GROUPS; },
+        toast() { return atlasUi.toast; },
+    },
+    methods: {
+        async run() {
+            const action = this.toast && this.toast.action;
+            atlasUi.toast = null;
+            if (action) await action();
+        },
+        close() { atlasUi.toast = null; },
+    },
+};
+
+// Die sechs Arten von „Neu anlegen" — Satz und Zielbereich aus dem Design.
+const ATLAS_NEW_TYPES = [
+    { key: 'task', label: 'Aufgabe', icon: 'task', text: 'Etwas, das du an einem bestimmten Tag erledigst.', where: 'Kalender', ph: 'z. B. Abb. 4.2 neu plotten', submit: 'Aufgabe anlegen' },
+    { key: 'note', label: 'Notiz', icon: 'note', text: 'Was du gelesen, besprochen oder entschieden hast.', where: 'Ideen & Notizen', ph: 'z. B. Müller et al. 2023 – Kalibrierverfahren', submit: 'Notiz anlegen' },
+    { key: 'idea', label: 'Idee', icon: 'bulb', text: 'Ein Gedanke, aus dem später ein Paper werden kann.', where: 'Ideen & Notizen', ph: 'z. B. Surrogatmodell für die Parameterstudie', submit: 'Idee anlegen' },
+    { key: 'chapter', label: 'Kapitel', icon: 'book', text: 'Ein Abschnitt deiner Dissertation.', where: 'Schreiben', ph: 'z. B. Kapitel 6 · Ausblick', submit: 'Kapitel anlegen' },
+    { key: 'pub', label: 'Veröffentlichung', icon: 'doc', text: 'Ein eigenes Paper – vom Entwurf bis zur Annahme.', where: 'Schreiben', ph: 'z. B. Journal-Paper zur Versuchsreihe B', submit: 'Veröffentlichung anlegen' },
+    { key: 'project', label: 'Projekt', icon: 'folder', text: 'Ein Forschungsprojekt mit Laufzeit und Meilensteinen.', where: 'Projekte', ph: 'z. B. DFG-Projekt, zweite Förderphase', submit: 'Projekt anlegen' },
+];
+
+// Die sechs Notiz-Arten (`zettel.type`) mit ihrem Erklärsatz. Der Typ
+// `fleeting` heißt in der Oberfläche „Gedanke" (#220).
+const ATLAS_NOTE_KINDS = [
+    { key: 'reading', label: 'Lektüre', help: 'Was du aus einem Paper oder Buch mitnimmst – mit der Quelle verknüpfbar.' },
+    { key: 'meeting', label: 'Besprechung', help: 'Ergebnisse aus einem Termin, z. B. mit der Betreuerin oder im Team.' },
+    { key: 'method', label: 'Methode', help: 'Wie du etwas machst: Verfahren, Einstellungen, Abläufe.' },
+    { key: 'decision', label: 'Entscheidung', help: 'Was du festgelegt hast – und warum.' },
+    { key: 'fleeting', label: 'Gedanke', help: 'Ein schneller Einfall, noch unsortiert. Kann später zur Idee werden.' },
+    { key: 'review', label: 'Rückblick', help: 'Was in einer Woche gut lief und was nicht.' },
+];
+
+// „Neu anlegen": jede Art in einem Satz erklärt, dazu wo sie landet. Angelegt
+// wird über die bestehenden Create-Endpunkte; nur der Titel ist Pflicht (P5).
+const AtlasNewDialog = {
+    components: { 'atlas-icon': AtlasIcon },
+    template: `
+        <div v-if="open" class="atlas-modal-backdrop" @click.self="close" @keydown.esc="close">
+            <div class="atlas-modal atlas-new" role="dialog" aria-modal="true" aria-labelledby="atlas-new-h">
+                <div class="atlas-new-head">
+                    <div>
+                        <h2 id="atlas-new-h" class="atlas-modal-title">Was möchtest du festhalten?</h2>
+                        <p class="atlas-modal-sub">Jede Art hat einen festen Platz in Atlas – darunter steht, wo du sie wiederfindest.</p>
+                    </div>
+                    <button type="button" class="atlas-icon-square" aria-label="Schließen" @click="close"><atlas-icon name="close" /></button>
+                </div>
+
+                <fieldset class="atlas-new-types">
+                    <legend class="atlas-sr">Art des neuen Eintrags</legend>
+                    <label v-for="t in types" :key="t.key" class="atlas-new-type" :class="{ 'is-on': type === t.key }">
+                        <input type="radio" name="atlas-new-art" class="atlas-sr" :value="t.key" v-model="type" />
+                        <span class="atlas-new-type-head">
+                            <span class="atlas-new-type-icon"><atlas-icon :name="t.icon" /></span>
+                            <span class="atlas-new-type-label">{{ t.label }}</span>
+                        </span>
+                        <span class="atlas-new-type-text">{{ t.text }}</span>
+                        <span class="atlas-new-type-where">→ {{ t.where }}</span>
+                    </label>
+                </fieldset>
+
+                <form class="atlas-new-form" @submit.prevent="submit">
+                    <fieldset v-if="type === 'note'" class="atlas-new-fieldset">
+                        <legend class="atlas-new-legend">Art der Notiz</legend>
+                        <div class="atlas-chip-row">
+                            <label v-for="k in noteKinds" :key="k.key" class="atlas-choice" :class="{ 'is-on': noteKind === k.key }">
+                                <input type="radio" name="atlas-notiz-art" class="atlas-sr" :value="k.key" v-model="noteKind" />{{ k.label }}
+                            </label>
+                        </div>
+                        <p class="atlas-new-help">{{ noteHelp }}</p>
+                    </fieldset>
+
+                    <div class="atlas-new-field">
+                        <label for="atlas-new-titel" class="atlas-new-legend">Titel</label>
+                        <input id="atlas-new-titel" ref="title" v-model="title" type="text" class="atlas-input"
+                               :placeholder="current.ph" autocomplete="off" />
+                    </div>
+
+                    <fieldset v-if="type === 'task'" class="atlas-new-fieldset">
+                        <legend class="atlas-new-legend">Wann?</legend>
+                        <div class="atlas-chip-row">
+                            <label v-for="w in whenOptions" :key="w.key" class="atlas-choice" :class="{ 'is-on': when === w.key }">
+                                <input type="radio" name="atlas-wann" class="atlas-sr" :value="w.key" v-model="when" />
+                                <atlas-icon v-if="w.key === 'date'" name="calendar" :size="16" />{{ w.label }}
+                            </label>
+                            <input v-if="when === 'date'" v-model="date" type="date" class="atlas-input is-date"
+                                   aria-label="Datum der Aufgabe" />
+                        </div>
+                    </fieldset>
+
+                    <div class="atlas-new-field">
+                        <label for="atlas-new-link" class="atlas-new-legend">Verknüpfen mit <span class="atlas-muted">(optional)</span></label>
+                        <div class="atlas-link-box">
+                            <span v-for="e in links" :key="e.id" class="atlas-chip">
+                                <span class="atlas-chip-kind">{{ kindLabel(e.kind) }}</span><span class="atlas-chip-label">{{ e.title || e.id }}</span>
+                                <button type="button" class="atlas-chip-x" :aria-label="'Verknüpfung mit ' + (e.title || e.id) + ' entfernen'" @click="unlink(e)">×</button>
+                            </span>
+                            <input id="atlas-new-link" v-model="linkQuery" type="text" class="atlas-link-input"
+                                   placeholder="Kapitel, Projekt oder Idee suchen …" autocomplete="off"
+                                   @keydown.enter.prevent="pickFirst" />
+                        </div>
+                        <div v-if="linkQuery.trim()" class="atlas-sug is-inline" role="listbox" aria-label="Vorschläge">
+                            <button v-for="e in linkHits" :key="e.id" type="button" role="option" class="atlas-sug-item"
+                                    @click="link(e)">
+                                <span class="atlas-sug-kind">{{ kindLabel(e.kind) }}</span>
+                                <span class="atlas-sug-title">{{ e.title || e.id }}</span>
+                            </button>
+                            <div v-if="!linkHits.length" class="atlas-sug-empty">Nichts gefunden.</div>
+                        </div>
+                    </div>
+                    <p v-if="error" class="atlas-error" role="alert">{{ error }}</p>
+                    <button type="submit" class="atlas-sr" tabindex="-1">{{ current.submit }}</button>
+                </form>
+
+                <div class="atlas-new-foot">
+                    <span class="atlas-muted">Nur der Titel ist Pflicht – alles andere geht auch später.</span>
+                    <div class="atlas-row-gap">
+                        <button type="button" class="atlas-btn" @click="close">Abbrechen</button>
+                        <button type="button" class="atlas-btn is-primary" :disabled="busy || !title.trim()" @click="submit">
+                            {{ busy ? 'Legt an…' : current.submit }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return {
+            type: 'task',
+            noteKind: 'reading',
+            title: '',
+            when: 'today',
+            date: '',
+            links: [],
+            linkQuery: '',
+            busy: false,
+            error: '',
+        };
+    },
+    computed: {
+        open() { return atlasUi.newOpen; },
+        types() { return ATLAS_NEW_TYPES; },
+        noteKinds() { return ATLAS_NOTE_KINDS; },
+        current() { return ATLAS_NEW_TYPES.find((t) => t.key === this.type) || ATLAS_NEW_TYPES[0]; },
+        noteHelp() { return (ATLAS_NOTE_KINDS.find((k) => k.key === this.noteKind) || ATLAS_NOTE_KINDS[0]).help; },
+        whenOptions() {
+            return [
+                { key: 'today', label: 'Heute' },
+                { key: 'tomorrow', label: 'Morgen' },
+                { key: 'monday', label: 'Montag' },
+                { key: 'date', label: 'Datum wählen' },
+            ];
+        },
+        linkHits() {
+            const q = this.linkQuery.trim().toLowerCase();
+            const taken = new Set(this.links.map((e) => e.id));
+            return atlasWork.entities
+                .filter((e) => !taken.has(e.id))
+                .filter((e) => e.id.toLowerCase().includes(q) || (e.title || '').toLowerCase().includes(q))
+                .slice(0, 6);
+        },
+    },
+    watch: {
+        open(now) {
+            if (!now) return;
+            this.reset();
+            this.type = atlasUi.newType || 'task';
+            if (atlasUi.newDay) {
+                this.when = 'date';
+                this.date = atlasUi.newDay;
+            }
+            this.links = (atlasUi.newLinks || []).map((e) => ({ ...e }));
+            atlasLoadEntities();
+            if (!atlasWork.today) atlasRefreshToday();
+            this.$nextTick(() => { if (this.$refs.title) this.$refs.title.focus(); });
+        },
+    },
+    methods: {
+        kindLabel(kind) { return ATLAS_KIND_LABEL[kind] || kind; },
+        reset() {
+            this.noteKind = 'reading';
+            this.title = '';
+            this.when = 'today';
+            this.date = '';
+            this.links = [];
+            this.linkQuery = '';
+            this.error = '';
+        },
+        close() { atlasUi.newOpen = false; },
+        link(e) {
+            if (!this.links.some((x) => x.id === e.id)) this.links.push(e);
+            this.linkQuery = '';
+        },
+        unlink(e) { this.links = this.links.filter((x) => x.id !== e.id); },
+        pickFirst() { if (this.linkHits.length) this.link(this.linkHits[0]); },
+        // Verknüpfungen ohne eigenes Feld werden zu Verweisen im Body — jedes
+        // `[[id]]` ist ein Verweis (atlas/links.py), der Rückverweis entsteht
+        // beim Indexieren von selbst.
+        linkBody(skipKinds = []) {
+            const rest = this.links.filter((e) => !skipKinds.includes(e.kind));
+            return rest.length ? 'Verknüpft mit ' + rest.map((e) => '[[' + e.id + ']]').join(', ') + '\n' : '';
+        },
+        idsOf(kind) { return this.links.filter((e) => e.kind === kind).map((e) => e.id); },
+        // Beim Anlegen bestimmt, nie gemerkt (ein computed hielte den Tag über
+        // Mitternacht): der Server-Tag, solange /journal/today noch nicht (oder
+        // nie) geantwortet hat der lokale — sonst scheitert das Anlegen.
+        taskDay() {
+            const today = atlasTodayIso();
+            if (this.when === 'tomorrow') return atlasAddDays(today, 1);
+            if (this.when === 'monday') return atlasNextMonday(today);
+            if (this.when === 'date') return this.date;
+            return today;
+        },
+        async create(title) {
+            const post = (url, body) => api(url, { method: 'POST', body: JSON.stringify(body) });
+            if (this.type === 'task') {
+                const day = this.taskDay();
+                if (!atlasDate(day)) throw new Error('error.atlas.date_invalid');
+                const anchors = this.links.map((e) => ' [[' + e.id + ']]').join('');
+                const week = atlasWeekIdOf(atlasDate(day));
+                const created = await post('/api/plugins/atlas/journal/' + encodeURIComponent(week) + '/tasks',
+                    { day, text: title + anchors });
+                await atlasRefreshToday();
+                return { route: null, toast: 'Aufgabe für ' + atlasShortDay(day) + ', ' + atlasDayMonth(day) + ' angelegt.', created };
+            }
+            if (this.type === 'note') {
+                const z = await post('/api/plugins/atlas/zettel', { title, type: this.noteKind, body: this.linkBody() });
+                return { route: '/atlas/zettel/' + encodeURIComponent(z.id), toast: 'Notiz angelegt.' };
+            }
+            if (this.type === 'idea') {
+                const i = await post('/api/plugins/atlas/ideas', { title, type: 'paper-idea', tags: [], body: this.linkBody() });
+                return { route: { path: '/atlas/sammlung', query: { tab: 'ideen', idea: i.id } }, toast: 'Idee angelegt.' };
+            }
+            if (this.type === 'chapter') {
+                const c = await post('/api/plugins/atlas/diss', {
+                    title, publications: this.idsOf('publication'), body: this.linkBody(['publication']),
+                });
+                return { route: { path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } }, toast: 'Kapitel angelegt.' };
+            }
+            if (this.type === 'pub') {
+                const p = await post('/api/plugins/atlas/publications', {
+                    title, projects: this.idsOf('project'), derived_from: this.idsOf('idea'),
+                    body: this.linkBody(['project', 'idea']),
+                });
+                return { route: atlasPublicationRoute(p.id), toast: 'Veröffentlichung angelegt.' };
+            }
+            const pr = await post('/api/plugins/atlas/projects', { title, body: this.linkBody() });
+            return { route: { path: '/atlas/sammlung', query: { tab: 'projekte', proj: pr.id } }, toast: 'Projekt angelegt.' };
+        },
+        async submit() {
+            const title = this.title.trim();
+            if (!title || this.busy) return;
+            this.busy = true;
+            this.error = '';
+            try {
+                const result = await this.create(title);
+                atlasLoadEntities(true);
+                atlasUi.newOpen = false;
+                atlasToast(result.toast);
+                if (result.route) this.$router.push(result.route);
+            } catch (e) {
+                this.error = atlasErrorText(e);
+            } finally {
+                this.busy = false;
+            }
+        },
+    },
+};
+
+// Die Detailadresse einer Veröffentlichung: ihre eigene Seite (#225/#226).
+// Das alte Formular im Drawer der Sammlung bleibt über `legacy=1` erreichbar.
+function atlasPublicationRoute(id) {
+    return '/atlas/veroeffentlichungen/' + encodeURIComponent(id);
+}
+
+function atlasPublicationLegacyRoute(id) {
+    return { path: '/atlas/sammlung', query: { tab: 'veroeffentlichungen', pub: id, legacy: '1' } };
+}
+
+// Suche im Kopf der Übersicht: Kapitel, Notizen, Ideen, Veröffentlichungen,
+// Projekte aus dem Entitäten-Cache, dazu die Aufgaben der Woche, die die
+// Seite schon geladen hat. Strg K setzt den Fokus.
+const AtlasSearch = {
+    components: { 'atlas-icon': AtlasIcon },
+    props: { tasks: { type: Array, default: () => [] } },
+    template: `
+        <div class="atlas-search">
+            <label class="atlas-search-field">
+                <atlas-icon name="search" />
+                <span class="atlas-sr">In Atlas suchen</span>
+                <input ref="input" v-model="q" type="search" class="atlas-search-input"
+                       placeholder="Kapitel, Notizen, Aufgaben suchen …" autocomplete="off"
+                       @keydown.esc="q = ''" @keydown.enter.prevent="openFirst" />
+                <kbd class="atlas-kbd">Strg K</kbd>
+            </label>
+            <div v-if="q.trim()" class="atlas-sug" role="listbox" aria-label="Suchergebnisse">
+                <router-link v-for="hit in hits" :key="hit.key" :to="hit.to" class="atlas-sug-item" role="option"
+                             @click="q = ''">
+                    <span class="atlas-sug-kind">{{ hit.kind }}</span>
+                    <span class="atlas-sug-title">{{ hit.title }}</span>
+                </router-link>
+                <div v-if="!hits.length" class="atlas-sug-empty">Nichts gefunden.</div>
+            </div>
+        </div>
+    `,
+    data() { return { q: '' }; },
+    computed: {
+        hits() {
+            const q = this.q.trim().toLowerCase();
+            if (!q) return [];
+            const out = [];
+            for (const e of atlasWork.entities) {
+                if (!(e.title || e.id).toLowerCase().includes(q)) continue;
+                const to = atlasEntityRoute(e);
+                if (to) out.push({ key: 'e:' + e.id, kind: ATLAS_KIND_LABEL[e.kind] || e.kind, title: e.title || e.id, to });
+            }
+            for (const t of this.tasks) {
+                if (!(t.text || '').toLowerCase().includes(q)) continue;
+                out.push({ key: 't:' + t.week + '#' + t.body_index, kind: 'Aufgabe', title: t.text, to: '/atlas/woche/' + t.week });
+            }
+            return out.slice(0, 10);
+        },
+    },
+    methods: {
+        openFirst() {
+            if (!this.hits.length) return;
+            this.$router.push(this.hits[0].to);
+            this.q = '';
+        },
+        onKey(e) {
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+                e.preventDefault();
+                if (this.$refs.input) this.$refs.input.focus();
+            }
+        },
+    },
+    mounted() {
+        atlasLoadEntities();
+        document.addEventListener('keydown', this.onKey);
+    },
+    beforeUnmount() {
+        document.removeEventListener('keydown', this.onKey);
+    },
+};
+
+// Der Kopf jeder Atlas-Seite: Kicker, Titel, optional eine Zeile darunter,
+// rechts die Aktionen der Seite (Slot) und immer „Neu anlegen".
+const AtlasHeader = {
+    components: { 'atlas-icon': AtlasIcon, 'atlas-search': AtlasSearch },
+    props: {
+        kicker: { type: String, default: 'Atlas' },
+        title: { type: String, default: '' },
+        subtitle: { type: String, default: '' },
+        search: { type: Boolean, default: false },
+        searchTasks: { type: Array, default: () => [] },
+        newLabel: { type: String, default: 'Neu anlegen' },
+        newType: { type: String, default: 'task' },
+    },
+    template: `
+        <header class="atlas-header">
+            <div class="atlas-header-text">
+                <div class="atlas-kicker">{{ kicker }}</div>
+                <h1 class="atlas-title"><slot name="title">{{ title }}</slot></h1>
+                <p v-if="subtitle || $slots.subtitle" class="atlas-subtitle"><slot name="subtitle">{{ subtitle }}</slot></p>
+            </div>
+            <div class="atlas-header-actions">
+                <atlas-search v-if="search" :tasks="searchTasks" />
+                <slot />
+                <button type="button" class="atlas-btn is-primary is-tall" @click="openNew">
+                    <atlas-icon name="plus" />{{ newLabel }}
+                </button>
+            </div>
+        </header>
+    `,
+    methods: {
+        openNew() { atlasOpenNew(this.newType); },
+    },
+};
+
+const AtlasNav = {
+    components: { 'atlas-icon': AtlasIcon, 'atlas-new-dialog': AtlasNewDialog, 'atlas-toast': AtlasToast },
+    props: { active: { type: String, default: '' } },
+    template: `
+        <div class="atlas-navwrap">
+            <nav class="atlas-nav" aria-label="Atlas-Bereiche">
+                <router-link v-for="a in areas" :key="a.key" :to="a.to"
+                             class="atlas-nav-item" :class="{ 'is-active': area && area.key === a.key }"
+                             :aria-current="area && area.key === a.key ? 'page' : null">
+                    <atlas-icon :name="a.icon" />{{ a.label }}
+                    <span v-if="a.badge && openCount" class="atlas-nav-badge"
+                          :title="openCount + (openCount === 1 ? ' offene Aufgabe heute' : ' offene Aufgaben heute')">{{ openCount }}</span>
+                </router-link>
+            </nav>
+            <div v-if="subItems.length || $slots.default" class="atlas-subnav-row">
+                <nav v-if="subItems.length" class="atlas-seg" :aria-label="area.label">
+                    <router-link v-for="s in subItems" :key="s.key" :to="s.to"
+                                 class="atlas-seg-item" :class="{ 'is-active': active === s.key }"
+                                 :aria-current="active === s.key ? 'page' : null">{{ s.label }}</router-link>
+                </nav>
+                <slot />
+            </div>
+            <atlas-new-dialog />
+            <atlas-toast />
+        </div>
+    `,
+    computed: {
+        areas() { return ATLAS_AREAS; },
+        area() { return atlasAreaOf(this.active); },
+        subItems() { return (this.area && this.area.sub) || []; },
         openCount() { return atlasWork.openCount; },
     },
 };
@@ -888,7 +1523,7 @@ function atlasChecklistItems(body) {
 // über die `atlasEntityRoute` das Sprungziel bestimmt.
 const ATLAS_BACKLINK_GROUPS = [
     { key: 'chapters', label: 'Kapitel', kind: 'diss_node' },
-    { key: 'zettel', label: 'Zettel', kind: 'zettel' },
+    { key: 'zettel', label: 'Notizen', kind: 'zettel' },
     { key: 'publications', label: 'Veröffentlichungen', kind: 'publication' },
     { key: 'projects', label: 'Projekte', kind: 'project' },
     { key: 'ideas', label: 'Ideen', kind: 'idea' },
@@ -918,7 +1553,7 @@ const AtlasBacklinks = {
             <div v-else class="atlas-card">
                 <p v-if="!count" class="atlas-empty">
                     Nichts zeigt hierher. Ein <code>[[{{ id || 'id' }}]]</code> in einem Body oder in einer
-                    Task-Zeile wird beim Indexieren zum Rückverweis.
+                    Aufgaben-Zeile wird beim Indexieren zum Rückverweis.
                 </p>
                 <div v-for="g in groups" :key="g.key" class="atlas-back-group">
                     <div class="atlas-back-kicker">{{ g.label }} · {{ g.rows.length }}</div>
@@ -928,12 +1563,12 @@ const AtlasBacklinks = {
                     </div>
                 </div>
                 <div v-if="tasks.length" class="atlas-back-group">
-                    <div class="atlas-back-kicker">Tasks · {{ tasks.length }}</div>
+                    <div class="atlas-back-kicker">Aufgaben · {{ tasks.length }}</div>
                     <div v-for="t in tasks" :key="t.id" class="atlas-back-task"
                          :class="{ 'is-done': t.done, 'is-pending': pending === t.id }">
                         <input type="checkbox" class="atlas-check" :checked="t.done"
                                :disabled="!!t.moved_to || pending === t.id"
-                               :aria-label="(t.done ? 'Task wieder öffnen: ' : 'Task erledigt: ') + t.text"
+                               :aria-label="(t.done ? 'Aufgabe wieder öffnen: ' : 'Aufgabe erledigt: ') + t.text"
                                @change="toggleTask(t)" />
                         <span class="atlas-back-task-text">{{ t.text || '(leere Zeile)' }}</span>
                         <router-link class="atlas-task-note" :to="'/atlas/woche/' + encodeURIComponent(t.week)"
@@ -1019,7 +1654,7 @@ const AtlasBacklinks = {
 const AtlasAnchorTasks = {
     props: {
         anchor: { type: String, required: true },
-        label: { type: String, default: 'Offene Tasks' },
+        label: { type: String, default: 'Offene Aufgaben' },
     },
     emits: ['changed'],
     template: `
@@ -1031,12 +1666,12 @@ const AtlasAnchorTasks = {
             <div v-if="loading" class="atlas-skel" style="height:48px"></div>
             <div v-else class="atlas-card">
                 <p v-if="!tasks.length" class="atlas-empty">
-                    Kein offener Task. Eine Zeile mit <code>[[{{ anchor }}]]</code> im Erfassen-Feld hängt einen hier an.
+                    Keine offene Aufgabe. Eine Zeile mit <code>[[{{ anchor }}]]</code> im Erfassen-Feld hängt einen hier an.
                 </p>
                 <div v-for="t in tasks" :key="t.id" class="atlas-back-task" :class="{ 'is-pending': pending === t.id }">
                     <input type="checkbox" class="atlas-check" :checked="t.done"
                            :disabled="pending === t.id"
-                           :aria-label="'Task erledigt: ' + t.text" @change="toggle(t)" />
+                           :aria-label="'Aufgabe erledigt: ' + t.text" @change="toggle(t)" />
                     <span class="atlas-back-task-text">{{ t.text || '(leere Zeile)' }}</span>
                     <span class="atlas-task-note" :class="{ 'is-accent': t.day === today }">{{ when(t) }}</span>
                 </div>
@@ -1098,25 +1733,29 @@ const AtlasAnchorTasks = {
 // `[[` öffnet die Vorschlagsliste über den Entitäten-Cache (Story 4).
 const AtlasCapture = {
     // `initial-mode` ist der Vorgabefall der Seite, auf der das Feld steht —
-    // auf der Zettel-Seite ist „Zettel" der häufigste Fall, überall sonst Task.
+    // auf der Notizen-Seite ist „Notiz" der häufigste Fall, überall sonst Aufgabe.
+    components: { 'atlas-icon': AtlasIcon },
     props: { initialMode: { type: String, default: 'task' } },
     emits: ['created'],
     template: `
         <form class="atlas-capture" @submit.prevent="submit">
-            <label class="atlas-capture-label" :for="inputId">Erfassen</label>
-            <input :id="inputId" ref="input" type="text" class="atlas-capture-input"
-                   :value="text" :placeholder="placeholder" autocomplete="off"
-                   @input="onInput" @keydown.down="moveSuggestion(1, $event)"
-                   @keydown.up="moveSuggestion(-1, $event)"
-                   @keydown.enter="onEnter" @keydown.esc="onEscape"
-                   @blur="closeSuggestions" />
-            <div class="atlas-modes" role="group" aria-label="Was wird angelegt">
-                <button v-for="m in modes" :key="m.key" type="button" class="atlas-mode"
+            <label class="atlas-capture-field" :for="inputId">
+                <span class="atlas-sr">Schnell erfassen</span>
+                <atlas-icon name="plus" />
+                <input :id="inputId" ref="input" type="text" class="atlas-capture-input"
+                       :value="text" :placeholder="placeholder" autocomplete="off"
+                       @input="onInput" @keydown.down="moveSuggestion(1, $event)"
+                       @keydown.up="moveSuggestion(-1, $event)"
+                       @keydown.enter="onEnter" @keydown.esc="onEscape"
+                       @blur="closeSuggestions" />
+            </label>
+            <div class="atlas-seg atlas-modes" role="group" aria-label="Was wird angelegt?">
+                <button v-for="m in modes" :key="m.key" type="button" class="atlas-seg-item atlas-mode"
                         :class="{ 'is-active': mode === m.key }"
                         :aria-pressed="mode === m.key ? 'true' : 'false'"
                         @click="setMode(m.key)">{{ m.label }}</button>
             </div>
-            <button type="submit" class="atlas-pill is-strong" :disabled="busy || !text.trim()">
+            <button type="submit" class="atlas-btn is-tall" :disabled="busy || !text.trim()">
                 {{ busy ? 'Legt an…' : 'Anlegen' }}
             </button>
             <div v-if="suggestOpen" ref="sug" class="atlas-sug" role="listbox">
@@ -1128,7 +1767,7 @@ const AtlasCapture = {
                     <span class="atlas-sug-title">{{ e.title || e.id }}</span>
                     <span class="atlas-sug-id">{{ e.id }}</span>
                 </button>
-                <div v-if="!suggestions.length" class="atlas-sug-empty">Keine Entität gefunden.</div>
+                <div v-if="!suggestions.length" class="atlas-sug-empty">Nichts gefunden.</div>
             </div>
         </form>
     `,
@@ -1143,17 +1782,15 @@ const AtlasCapture = {
             anchorStart: -1,
             inputId: 'atlas-capture-' + Math.random().toString(36).slice(2, 8),
             modes: [
-                { key: 'task', label: 'Task' },
-                { key: 'zettel', label: 'Zettel' },
+                { key: 'task', label: 'Aufgabe' },
+                { key: 'zettel', label: 'Notiz' },
                 { key: 'idee', label: 'Idee' },
             ],
         };
     },
     computed: {
         placeholder() {
-            if (this.mode === 'zettel') return 'Titel des Zettels …';
-            if (this.mode === 'idee') return 'Titel der Idee …';
-            return 'Eine Zeile … Anker per [[kapitel-03]], Tag per #methodik';
+            return ATLAS_CAPTURE_PLACEHOLDER[this.mode] || ATLAS_CAPTURE_PLACEHOLDER.task;
         },
         suggestions() {
             if (!this.suggestOpen) return [];
@@ -1302,10 +1939,10 @@ const AtlasTaskRow = {
         <div class="atlas-task" :class="{ 'is-done': task.done, 'is-moved': !!task.moved_to, 'is-pending': pending }">
             <input type="checkbox" class="atlas-check" :checked="task.done"
                    :disabled="!!task.moved_to"
-                   :aria-label="(task.done ? 'Task wieder öffnen: ' : 'Task erledigt: ') + task.text"
+                   :aria-label="(task.done ? 'Aufgabe wieder öffnen: ' : 'Aufgabe erledigt: ') + task.text"
                    @change="$emit('toggle')" />
             <input v-if="editing" ref="edit" class="atlas-task-edit" v-model="draft"
-                   aria-label="Task-Text bearbeiten"
+                   aria-label="Aufgabentext bearbeiten"
                    @keydown.enter.prevent="commit" @keydown.esc.prevent="cancel" @blur="commit" />
             <template v-else>
                 <button type="button" class="atlas-task-text" :title="'Zum Bearbeiten klicken — ' + (task.raw || '')"
@@ -1318,11 +1955,11 @@ const AtlasTaskRow = {
             <div class="atlas-task-actions">
                 <button v-if="carryable" type="button" class="atlas-link-btn" style="margin-right:6px"
                         @click="$emit('carry')">→ heute</button>
-                <button v-if="reorderable" type="button" class="atlas-icon-btn" aria-label="Task nach oben"
+                <button v-if="reorderable" type="button" class="atlas-icon-btn" aria-label="Aufgabe nach oben"
                         :disabled="first || editing" @click="$emit('move-up')">↑</button>
-                <button v-if="reorderable" type="button" class="atlas-icon-btn" aria-label="Task nach unten"
+                <button v-if="reorderable" type="button" class="atlas-icon-btn" aria-label="Aufgabe nach unten"
                         :disabled="last || editing" @click="$emit('move-down')">↓</button>
-                <button type="button" class="atlas-icon-btn is-danger" aria-label="Task löschen"
+                <button type="button" class="atlas-icon-btn is-danger" aria-label="Aufgabe löschen"
                         :disabled="editing" @click="$emit('remove')">✕</button>
             </div>
         </div>
@@ -1354,82 +1991,77 @@ const AtlasTaskRow = {
     },
 };
 
+// Sammlungs-Einträge (ADR-0022, Issue #205): jede Kern-Sammlung erscheint in
+// Atlas als Veröffentlichung (oder, verschoben, als Forschungsprojekt). Das
+// Badge sagt, dass die Literatur im Kern gepflegt wird; `entry.collection`
+// liefert der Server (Name, archiviert, ohne Datei).
+const AtlasCollectionBadge = {
+    props: { entry: { type: Object, required: true } },
+    template: `
+        <span v-if="entry.collection" class="atlas-collection-badge"
+              :class="{ 'is-archived': entry.collection.archived }"
+              :title="entry.collection.archived ? 'Archivierte Sammlung — Literatur im Kern' : 'Sammlung — Literatur wird im Kern gepflegt'"
+              data-testid="atlas-collection-badge">Sammlung<template v-if="entry.collection.archived"> · archiviert</template></span>
+    `,
+};
+
 const AtlasPage = {
     components: {
         'atlas-editor': AtlasEditor,
         'atlas-nav': AtlasNav,
+        'atlas-header': AtlasHeader,
         'atlas-capture': AtlasCapture,
         'atlas-backlinks': AtlasBacklinks,
         'atlas-anchor-tasks': AtlasAnchorTasks,
+        'atlas-collection-badge': AtlasCollectionBadge,
     },
     template: `
-        <div class="p-6 relative" @dragover="onRootDragOver" @dragleave="onDragLeave" @drop.prevent.stop="onDropMd">
+        <div class="atlas-shell relative" lang="de" @dragover="onRootDragOver" @dragleave="onDragLeave" @drop.prevent.stop="onDropMd">
             <!-- .md drag-and-drop overlay -->
             <div v-if="dragOver" class="absolute inset-0 z-30 border-2 border-dashed border-accent rounded-xl flex items-center justify-center pointer-events-none" style="background: var(--lb-accent-soft); opacity:.92;">
                 <span class="text-accent-ink font-medium">Markdown-Datei (.md) hier ablegen, um sie als Idee zu importieren</span>
             </div>
             <input ref="mdInput" type="file" accept=".md" multiple class="hidden" @change="onImportFiles" />
 
-            <!-- Werkbank-Navigation + Erfassen-Feld (#180) — auf jeder Atlas-Seite -->
-            <atlas-nav :active="navKey" class="mb-4" />
-            <atlas-capture class="mb-5" @created="onCaptured" />
-
-            <!-- Header -->
-            <div class="flex items-center justify-between mb-5">
-                <div>
-                    <h1 class="text-2xl font-semibold text-ink">Sammlung</h1>
-                    <p class="text-sm text-mute">Kapitel, Veröffentlichungen, Ideen und Projekte — erfassen, ordnen und mit Literatur verknüpfen.</p>
-                </div>
-                <div class="flex items-center gap-2">
+            <!-- Kopf + Bereichsnavigation (#223) — auf jeder Atlas-Seite -->
+            <atlas-header :kicker="headKicker" :title="headTitle" :new-type="headNewType">
                     <template v-if="tab === 'ideen'">
                         <button @click="onImportClick"
-                                class="inline-flex items-center gap-1.5 border border-hairline text-ink-2 px-3 py-2 rounded-lg text-sm font-medium hover:border-accent transition-colors">
+                                class="atlas-pill">
                             .md importieren
                         </button>
                         <button @click="openCapture"
-                                class="inline-flex items-center gap-1.5 bg-accent text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
+                                class="atlas-pill">
                             <span>+</span> Neue Idee
                         </button>
                     </template>
                     <template v-else-if="tab === 'dissertation'">
                         <button @click="openNodeCreate"
-                                class="inline-flex items-center gap-1.5 bg-accent text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
+                                class="atlas-pill">
                             <span>+</span> Neues Kapitel
                         </button>
                     </template>
                     <template v-else-if="tab === 'veroeffentlichungen'">
                         <button @click="openPublicationCreate"
-                                class="inline-flex items-center gap-1.5 bg-accent text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
+                                class="atlas-pill">
                             <span>+</span> Neue Veröffentlichung
                         </button>
                     </template>
                     <template v-else-if="tab === 'editor'">
                         <button @click="goTab('veroeffentlichungen')"
-                                class="inline-flex items-center gap-1.5 border border-hairline text-ink-2 px-3 py-2 rounded-lg text-sm font-medium hover:border-accent transition-colors">
+                                class="atlas-pill">
                             ← Zurück zu Veröffentlichungen
                         </button>
                     </template>
                     <button v-else-if="tab === 'projekte'" @click="openProjectCreate"
-                            class="inline-flex items-center gap-1.5 bg-accent text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
+                            class="atlas-pill">
                         <span>+</span> Neues Projekt
                     </button>
-                </div>
-            </div>
-
-            <!-- Tabs -->
-            <div class="flex gap-1 mb-5 border-b border-hairline">
-                <button @click="goTab('ideen')" class="px-3 py-2 text-sm -mb-px border-b-2 transition-colors"
-                        :class="tab === 'ideen' ? 'border-accent text-ink font-medium' : 'border-transparent text-mute hover:text-ink'">Ideen</button>
-                <button @click="goTab('veroeffentlichungen')" class="px-3 py-2 text-sm -mb-px border-b-2 transition-colors"
-                        :class="tab === 'veroeffentlichungen' ? 'border-accent text-ink font-medium' : 'border-transparent text-mute hover:text-ink'">Veröffentlichungen</button>
-                <button @click="goTab('dissertation')" class="px-3 py-2 text-sm -mb-px border-b-2 transition-colors"
-                        :class="tab === 'dissertation' ? 'border-accent text-ink font-medium' : 'border-transparent text-mute hover:text-ink'">Kapitel</button>
-                <button @click="goTab('projekte')" class="px-3 py-2 text-sm -mb-px border-b-2 transition-colors"
-                        :class="tab === 'projekte' ? 'border-accent text-ink font-medium' : 'border-transparent text-mute hover:text-ink'">Projekte</button>
-                <!-- Kein eigener Manuskripte/Editor-Tab (ADR-0004): der Editor wird
-                     über die Manuskript-Links einer Veröffentlichung geöffnet. -->
-                <span v-if="tab === 'editor'" class="px-3 py-2 text-sm -mb-px border-b-2 border-accent text-ink font-medium">Manuskript-Editor</span>
-            </div>
+            </atlas-header>
+            <!-- Die Bereiche ersetzen die Tabs der Sammlung; welcher Bereich und
+                 welche Unternavigation leuchtet, sagt navKey. Der Editor hat
+                 weiterhin keinen eigenen Eintrag (ADR-0004). -->
+            <atlas-nav :active="navKey" class="mb-5" />
 
             <!-- ===== IDEEN TAB ===== -->
             <template v-if="tab === 'ideen'">
@@ -1634,11 +2266,11 @@ const AtlasPage = {
                             </div>
                             <div class="atlas-metric">
                                 <div class="atlas-metric-n">{{ nodeMetrics.zettel_count || 0 }}</div>
-                                <div class="atlas-metric-l">Zettel</div>
+                                <div class="atlas-metric-l">Notizen</div>
                             </div>
                             <div class="atlas-metric">
                                 <div class="atlas-metric-n" :class="{ 'is-warn': nodeMetrics.open_task_count }">{{ nodeMetrics.open_task_count || 0 }}</div>
-                                <div class="atlas-metric-l">offene Tasks</div>
+                                <div class="atlas-metric-l">offene Aufgaben</div>
                             </div>
                             <div class="atlas-metric">
                                 <div class="atlas-metric-n">{{ nodeMetrics.ref_count || 0 }}</div>
@@ -1670,7 +2302,7 @@ const AtlasPage = {
 
                                 <!-- Offene Tasks an diesem Kapitel (Story 50) -->
                                 <atlas-anchor-tasks :key="'nt-' + selectedNode.id" :anchor="selectedNode.id"
-                                                    label="Offene Tasks an diesem Kapitel" @changed="refreshNodeHub" />
+                                                    label="Offene Aufgaben an diesem Kapitel" @changed="refreshNodeHub" />
 
                                 <div>
                                     <div class="flex items-center justify-between mb-1">
@@ -1701,12 +2333,12 @@ const AtlasPage = {
                                 <!-- Verlinkte Zettel (Story 49) -->
                                 <section class="atlas-sec">
                                     <div class="atlas-sec-head">
-                                        <h3 class="atlas-sec-title">Verlinkte Zettel<template v-if="nodeZettel.length"> · {{ nodeZettel.length }}</template></h3>
+                                        <h3 class="atlas-sec-title">Verlinkte Notizen<template v-if="nodeZettel.length"> · {{ nodeZettel.length }}</template></h3>
                                         <router-link to="/atlas/zettel" class="atlas-link-btn" style="text-decoration:none">alle</router-link>
                                     </div>
                                     <div class="atlas-card">
                                         <p v-if="!nodeZettel.length" class="atlas-empty">
-                                            Kein Zettel verweist auf dieses Kapitel. Ein <code>[[{{ selectedNode.id }}]]</code> im Zettel-Text genügt.
+                                            Keine Notiz verweist auf dieses Kapitel. Ein <code>[[{{ selectedNode.id }}]]</code> im Text einer Notiz genügt.
                                         </p>
                                         <router-link v-for="z in nodeZettel" :key="z.id" class="atlas-list-row"
                                                      :to="'/atlas/zettel/' + encodeURIComponent(z.id)">
@@ -1721,11 +2353,11 @@ const AtlasPage = {
                                 <section class="atlas-sec">
                                     <div class="atlas-sec-head">
                                         <h3 class="atlas-sec-title">Literatur<template v-if="nodeLiterature.length"> · {{ nodeLiterature.length }}</template></h3>
-                                        <span class="atlas-sec-note">Kapitel + Zettel</span>
+                                        <span class="atlas-sec-note">Kapitel + Notizen</span>
                                     </div>
                                     <div class="atlas-card">
                                         <p v-if="!nodeLiterature.length" class="atlas-empty">
-                                            Noch keine Referenzen — sie kommen aus den zugeordneten Veröffentlichungen und den verlinkten Zetteln.
+                                            Noch keine Referenzen — sie kommen aus den zugeordneten Veröffentlichungen und den verlinkten Notizen.
                                         </p>
                                         <div v-for="r in nodeLiteratureShown" :key="r.citekey" class="atlas-lit">
                                             <span class="atlas-lit-key">{{ r.citekey }}</span>
@@ -1805,6 +2437,7 @@ const AtlasPage = {
                                             <div class="flex items-center gap-2 mb-2">
                                                 <span class="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0" :class="pubStatusClass(p.status)">{{ pubStatusLabel(p.status) }}</span>
                                                 <span v-if="p.type" class="text-[10px] px-1.5 py-0.5 rounded bg-bg-soft text-ink-3 flex-shrink-0">{{ pubTypeLabel(p.type) }}</span>
+                                                <atlas-collection-badge :entry="p" />
                                                 <span v-if="p.errors && p.errors.length" title="Validierungswarnung" class="text-[10px] text-amber-600 flex-shrink-0">⚠</span>
                                                 <span v-if="p.due" class="text-[11px] text-amber-700 flex-shrink-0 ml-auto">fällig {{ p.due }}</span>
                                             </div>
@@ -1828,6 +2461,7 @@ const AtlasPage = {
                                         <button v-for="p in group.pubs" :key="p.id" @click="selectPublication(p.id)"
                                                 class="w-full text-left bg-white border border-hairline rounded-lg px-4 py-2.5 hover:border-accent transition-colors flex items-center gap-3">
                                             <span class="text-sm font-medium text-ink flex-1 truncate">{{ p.title }}</span>
+                                            <atlas-collection-badge :entry="p" />
                                             <span v-if="p.venue" class="text-xs text-mute flex-shrink-0 truncate max-w-[160px]">{{ p.venue }}</span>
                                             <span v-if="p.submitted" class="text-[11px] text-amber-700 flex-shrink-0 whitespace-nowrap">⏳ {{ waitingDays(p.submitted) }} Tage</span>
                                         </button>
@@ -1839,7 +2473,7 @@ const AtlasPage = {
                                     <div class="space-y-1">
                                         <button v-for="p in group.pubs" :key="p.id" @click="selectPublication(p.id)"
                                                 class="w-full text-left text-sm text-ink hover:text-accent-ink transition-colors py-1 px-1">
-                                            <span v-if="p.published" class="text-mute font-mono">{{ p.published.slice(0, 4) }}</span><span v-if="p.published"> · </span><span class="font-medium">{{ p.title }}</span><span v-if="p.venue" class="text-mute"> · {{ p.venue }}</span>
+                                            <span v-if="p.published" class="text-mute font-mono">{{ p.published.slice(0, 4) }}</span><span v-if="p.published"> · </span><span class="font-medium">{{ p.title }}</span><span v-if="p.venue" class="text-mute"> · {{ p.venue }}</span> <atlas-collection-badge :entry="p" />
                                         </button>
                                     </div>
                                 </template>
@@ -1851,6 +2485,7 @@ const AtlasPage = {
                                                 class="w-full text-left bg-white border border-hairline rounded-lg px-4 py-2.5 hover:border-accent transition-colors flex items-center gap-3">
                                             <span class="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0" :class="pubStatusClass(p.status)">{{ pubStatusLabel(p.status) }}</span>
                                             <span class="text-sm text-ink flex-1 truncate">{{ p.title }}</span>
+                                            <atlas-collection-badge :entry="p" />
                                             <span v-if="p.venue" class="text-xs text-mute truncate max-w-[160px]">{{ p.venue }}</span>
                                         </button>
                                     </div>
@@ -1892,10 +2527,13 @@ const AtlasPage = {
                                     <span class="text-[10px] px-1.5 py-0.5 rounded" :class="pubStatusClass(selectedPublication.status)">{{ pubStatusLabel(selectedPublication.status) }}</span>
                                     <span v-if="selectedPublication.type" class="text-[10px] px-1.5 py-0.5 rounded bg-bg-soft text-ink-3">{{ pubTypeLabel(selectedPublication.type) }}</span>
                                     <span v-if="selectedPublication.venue" class="text-[11px] text-mute">{{ selectedPublication.venue }}</span>
+                                    <atlas-collection-badge :entry="selectedPublication" />
                                 </div>
                                 <h2 class="text-xl font-semibold text-ink font-serif">{{ selectedPublication.title }}</h2>
                             </div>
                             <div class="flex items-center gap-3">
+                                <button v-if="!publicationEditing && selectedPublication.collection" @click="switchCollectionKind(selectedPublication, 'project')"
+                                        class="text-xs font-medium text-accent-ink hover:underline">Zu Forschungsprojekt verschieben</button>
                                 <button v-if="!publicationEditing" @click="startPublicationEdit" class="text-xs font-medium text-accent-ink hover:underline">Bearbeiten</button>
                                 <button @click="closePublicationDrawer" class="text-mute hover:text-ink text-xl leading-none">×</button>
                             </div>
@@ -1915,8 +2553,12 @@ const AtlasPage = {
 
                                 <div class="mt-6">
                                     <div class="flex items-center justify-between mb-2">
-                                        <p class="text-[11px] uppercase tracking-wide text-mute">Referenzen (Bibliographie)</p>
-                                        <button @click="openBibtexImport" class="text-[11px] font-medium text-accent-ink hover:underline">+ .bib importieren</button>
+                                        <p class="text-[11px] uppercase tracking-wide text-mute">{{ selectedPublication.collection ? 'Literatur (Sammlung, nur lesbar)' : 'Referenzen (Bibliographie)' }}</p>
+                                        <div class="flex items-center gap-3">
+                                            <button v-if="selectedPublication.collection" @click="openCollectionInCore(selectedPublication)"
+                                                    class="text-[11px] font-medium text-accent-ink hover:underline">In Sammlung bearbeiten</button>
+                                            <button @click="openBibtexImport" class="text-[11px] font-medium text-accent-ink hover:underline">+ .bib importieren</button>
+                                        </div>
                                     </div>
                                     <ul v-if="publicationRefsResolved.length" class="space-y-1">
                                         <li v-for="r in publicationRefsResolved" :key="r.citekey" class="text-xs">
@@ -2017,7 +2659,8 @@ const AtlasPage = {
                         <div v-else class="p-6 space-y-4">
                             <div>
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Titel</label>
-                                <input v-model="publicationEdit.title" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none" />
+                                <input v-model="publicationEdit.title" :disabled="!!selectedPublication.collection" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none disabled:bg-bg-soft disabled:text-mute" />
+                                <p v-if="selectedPublication.collection" class="text-[11px] text-mute mt-1">Der Name kommt aus der Sammlung und wird dort geändert.</p>
                             </div>
                             <div class="flex gap-3">
                                 <div class="flex-1">
@@ -2060,7 +2703,7 @@ const AtlasPage = {
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Tags (kommagetrennt)</label>
                                 <input v-model="publicationEdit.tags" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none" />
                             </div>
-                            <div>
+                            <div v-if="!selectedPublication.collection">
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Referenzen (Cite Keys, einer pro Zeile)</label>
                                 <textarea v-model="publicationEdit.refs" rows="3" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-accent outline-none"></textarea>
                             </div>
@@ -2086,7 +2729,8 @@ const AtlasPage = {
                             </div>
                             <p v-if="publicationError" class="text-xs text-red-600">{{ publicationError }}</p>
                             <div class="flex justify-between items-center">
-                                <button @click="deletePublication" class="text-xs text-red-600 hover:underline">Löschen…</button>
+                                <button v-if="!selectedPublication.collection || selectedPublication.path" @click="deletePublication" class="text-xs text-red-600 hover:underline">{{ selectedPublication.collection ? 'Atlas-Angaben löschen…' : 'Löschen…' }}</button>
+                                <span v-else></span>
                                 <div class="flex gap-2">
                                     <button @click="publicationEditing = false" class="px-4 py-2 text-sm text-ink-3 hover:text-ink transition-colors">Abbrechen</button>
                                     <button @click="savePublicationEdit" :disabled="!publicationEdit.title.trim() || savingPublication"
@@ -2128,7 +2772,7 @@ const AtlasPage = {
                                     {{ bibtexStep === 1 ? 'Schritt 1/3 · .bib-Datei wählen' :
                                        bibtexStep === 2 ? 'Schritt 2/3 · Einträge prüfen' :
                                        'Schritt 3/3 · PDFs herunterladen' }}
-                                    · Veröffentlichung „{{ selectedPublication ? selectedPublication.title : '' }}"
+                                    · {{ selectedPublication && selectedPublication.collection ? 'Sammlung' : 'Veröffentlichung' }} „{{ selectedPublication ? selectedPublication.title : '' }}"
                                 </p>
                             </div>
                             <button @click="closeBibtexImport" :disabled="bibtexDownloading" class="text-mute hover:text-ink text-xl leading-none disabled:opacity-40">×</button>
@@ -2193,7 +2837,7 @@ const AtlasPage = {
                                             {{ bibtexCommitSummary.created }} neu angelegt · {{ bibtexCommitSummary.matched }} mit Bibliothek verknüpft
                                             <span v-if="bibtexCommitSummary.enriched"> · {{ bibtexCommitSummary.enriched }} angereichert</span>
                                             <span v-if="bibtexCommitSummary.errors"> · <span class="text-red-600">{{ bibtexCommitSummary.errors }} Fehler</span></span>
-                                            — alle der Veröffentlichung zugeordnet.
+                                            — alle {{ selectedPublication && selectedPublication.collection ? 'in die Sammlung übernommen' : 'der Veröffentlichung zugeordnet' }}.
                                         </div>
                                         <button v-if="bibtexCommitSummary.created && !bibtexImportRemoved" @click="removeImportedPapers" :disabled="bibtexLoading"
                                                 class="flex-shrink-0 text-xs font-medium text-red-600 hover:underline disabled:opacity-40">Importierte entfernen</button>
@@ -2282,6 +2926,7 @@ const AtlasPage = {
                             <div class="flex items-center gap-2 mb-2">
                                 <span class="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0" :class="projStatusClass(p.status)">{{ projStatusLabel(p.status) }}</span>
                                 <span class="text-sm font-medium text-ink flex-1 truncate">{{ p.title }}</span>
+                                <atlas-collection-badge :entry="p" />
                                 <span v-if="p.funder || p.grant_id" class="text-[11px] text-mute flex-shrink-0">
                                     {{ [p.funder, p.grant_id].filter(Boolean).join(' · ') }}
                                 </span>
@@ -2334,6 +2979,7 @@ const AtlasPage = {
                                 <div class="flex items-center gap-2">
                                     <span class="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0" :class="projStatusClass(p.status)">{{ projStatusLabel(p.status) }}</span>
                                     <span class="text-sm text-ink-2 flex-1 truncate">{{ p.title }}</span>
+                                    <atlas-collection-badge :entry="p" />
                                     <span v-if="p.start || p.end" class="text-[11px] text-mute flex-shrink-0">{{ projPeriod(p) }}</span>
                                 </div>
                             </button>
@@ -2349,10 +2995,13 @@ const AtlasPage = {
                                 <div class="flex items-center gap-2 mb-1">
                                     <span class="text-[10px] px-1.5 py-0.5 rounded" :class="projStatusClass(selectedProject.status)">{{ projStatusLabel(selectedProject.status) }}</span>
                                     <span v-if="selectedProject.start || selectedProject.end" class="text-[11px] text-mute">{{ projPeriod(selectedProject) }}</span>
+                                    <atlas-collection-badge :entry="selectedProject" />
                                 </div>
                                 <h2 class="text-xl font-semibold text-ink font-serif">{{ selectedProject.title }}</h2>
                             </div>
                             <div class="flex items-center gap-3">
+                                <button v-if="!projectEditing && selectedProject.collection" @click="switchCollectionKind(selectedProject, 'publication')"
+                                        class="text-xs font-medium text-accent-ink hover:underline">Zur Veröffentlichung verschieben</button>
                                 <button v-if="!projectEditing" @click="startProjectEdit" class="text-xs font-medium text-accent-ink hover:underline">Bearbeiten</button>
                                 <button @click="closeProjectDrawer" class="text-mute hover:text-ink text-xl leading-none">×</button>
                             </div>
@@ -2419,7 +3068,11 @@ const AtlasPage = {
                                     </div>
                                 </div>
                                 <div>
-                                    <p class="text-[11px] uppercase tracking-wide text-mute mb-1">Referenzen</p>
+                                    <div class="flex items-center justify-between mb-1">
+                                        <p class="text-[11px] uppercase tracking-wide text-mute">{{ selectedProject.collection ? 'Literatur (Sammlung, nur lesbar)' : 'Referenzen' }}</p>
+                                        <button v-if="selectedProject.collection" @click="openCollectionInCore(selectedProject)"
+                                                class="text-[11px] font-medium text-accent-ink hover:underline">In Sammlung bearbeiten</button>
+                                    </div>
                                     <ul v-if="projectRefsResolved.length" class="space-y-1">
                                         <li v-for="r in projectRefsResolved" :key="r.citekey" class="text-xs">
                                             <button v-if="r.found" @click="$router.push('/paper/' + r.paper_id)"
@@ -2500,7 +3153,8 @@ const AtlasPage = {
                         <div v-else class="p-6 space-y-4">
                             <div>
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Titel</label>
-                                <input v-model="projectEdit.title" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none" />
+                                <input v-model="projectEdit.title" :disabled="!!selectedProject.collection" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none disabled:bg-bg-soft disabled:text-mute" />
+                                <p v-if="selectedProject.collection" class="text-[11px] text-mute mt-1">Der Name kommt aus der Sammlung und wird dort geändert.</p>
                             </div>
                             <div class="flex gap-3">
                                 <div class="flex-1">
@@ -2546,7 +3200,7 @@ const AtlasPage = {
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Tags (kommagetrennt)</label>
                                 <input v-model="projectEdit.tags" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent outline-none" />
                             </div>
-                            <div>
+                            <div v-if="!selectedProject.collection">
                                 <label class="block text-[11px] uppercase tracking-wide text-mute mb-1">Referenzen (Citekeys, eine pro Zeile)</label>
                                 <textarea v-model="projectEdit.refs" rows="3" class="w-full border border-hairline rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-accent outline-none"></textarea>
                             </div>
@@ -2938,6 +3592,7 @@ const AtlasPage = {
             projectPublications: [],
             // Projektdokumente (projekte/<id>/, Issue #49) — Verzeichnislisting, kein Index
             projectDocuments: [],
+            projectDocumentsLoaded: false,
             projectDocUploading: false,
             projectDocsError: '',
             projectExtractingDocName: '',
@@ -2989,6 +3644,22 @@ const AtlasPage = {
         // haben noch keinen eigenen Bereich (ADR-0004) und hängen deshalb an
         // der Veröffentlichungs-Ansicht, erkennbar an ?focus=manuskripte.
         focusManuscripts() { return this.$route.query.focus === 'manuskripte'; },
+        // Kopf der Sammlung je Bereich (#223): Kicker = Bereich, Titel = Unterpunkt.
+        headKicker() {
+            const area = atlasAreaOf(this.navKey);
+            return 'Atlas · ' + (area ? area.label : 'Sammlung');
+        },
+        headTitle() {
+            const titles = {
+                kapitel: 'Dissertation', veroeffentlichungen: 'Veröffentlichungen',
+                manuskripte: 'Manuskripte', ideen: 'Ideen', projekte: 'Projekte',
+            };
+            return titles[this.navKey] || 'Sammlung';
+        },
+        headNewType() {
+            const types = { kapitel: 'chapter', veroeffentlichungen: 'pub', manuskripte: 'pub', ideen: 'idea', projekte: 'project' };
+            return types[this.navKey] || 'task';
+        },
         navKey() {
             if (this.tab === 'editor') return 'manuskripte';
             if (this.tab === 'veroeffentlichungen') {
@@ -3150,9 +3821,10 @@ const AtlasPage = {
                 { key: 'geplant',        label: 'Geplant',                statuses: ['planned'] },
                 { key: 'abgelehnt',      label: 'Abgelehnt / Zurückgezogen', statuses: ['rejected', 'withdrawn'] },
             ];
-            return GROUPS
-                .map((g) => ({ ...g, pubs: this.publications.filter((p) => g.statuses.includes(p.status)) }))
-                .filter((g) => g.pubs.length > 0);
+            // Virtuelle Sammlungs-Einträge gibt es seit ADR-0025 nicht mehr.
+            const groups = GROUPS
+                .map((g) => ({ ...g, pubs: this.publications.filter((p) => g.statuses.includes(p.status)) }));
+            return groups.filter((g) => g.pubs.length > 0);
         },
     },
     methods: {
@@ -3230,6 +3902,26 @@ const AtlasPage = {
             this.$router.replace({ path: '/atlas/sammlung', query: { tab: key } });
         },
         applyRouteIdea() {
+            // Veröffentlichungen haben seit #225 eine Pipeline und eine eigene
+            // Seite: alte Tiefenlinks (?tab=veroeffentlichungen[&pub=…]) führen
+            // dorthin. Das alte Formular bleibt mit `legacy=1`, die Liste der
+            // Manuskripte mit `focus=manuskripte` erreichbar.
+            const rq = this.$route.query;
+            if (rq.pub && !rq.legacy) {
+                this.$router.replace(atlasPublicationRoute(rq.pub));
+                return;
+            }
+            if (rq.tab === 'veroeffentlichungen' && !rq.pub && rq.focus !== 'manuskripte') {
+                this.$router.replace(ATLAS_PUBLICATIONS_ROUTE);
+                return;
+            }
+            // ?tab=editor&manuscript=<id> öffnet den LaTeX-Editor (Pipeline,
+            // Detailseite der Veröffentlichung).
+            if (rq.tab === 'editor' && rq.manuscript) {
+                this.editorInitialId = String(rq.manuscript);
+                this.tab = 'editor';
+                return;
+            }
             // Deep-open from the library reference panel: ?idea=<id>
             // (#180: the Sammlung moved to /atlas/sammlung, the query keys stay.)
             const tab = this.$route.query.tab;
@@ -3402,8 +4094,8 @@ const AtlasPage = {
                 this.closeDrawer();
                 await this.load();
                 await this.loadPublications();
-                this.tab = 'veroeffentlichungen';
-                await this.selectPublication(res.publication.id);
+                // Die Veröffentlichung hat eine eigene Seite (#225/#226).
+                this.$router.push(atlasPublicationRoute(res.publication.id));
             } catch (e) {
                 alert('Ausarbeiten fehlgeschlagen: ' + e.message);
             } finally {
@@ -3661,7 +4353,7 @@ const AtlasPage = {
         },
         openIdeaFromNode(id) {
             this.selectedNodeId = null;
-            this.tab = 'ideen';
+            this.goTab('ideen');
             this.selectedId = id;
         },
         toggleIdeaPicker() {
@@ -3727,8 +4419,7 @@ const AtlasPage = {
         },
         openPublicationFromNode(id) {
             this.closeNodeDrawer();
-            this.tab = 'veroeffentlichungen';
-            this.selectPublication(id);
+            this.$router.push(atlasPublicationRoute(id));
         },
         // --- chapter reordering (up/down arrows, ADR-0005, issue #62) --------
         // Persists new order by swapping the `order` values of adjacent chapters
@@ -3806,6 +4497,7 @@ const AtlasPage = {
             this.projectRefsResolved = [];
             this.projectPublications = [];
             this.projectDocuments = [];
+            this.projectDocumentsLoaded = false;
             this.projectDocsError = '';
             this.projectExtractingDocName = '';
             this.projectExtractWarning = '';
@@ -3829,6 +4521,7 @@ const AtlasPage = {
             this.projectEditing = false;
             this.projectPublications = [];
             this.projectDocuments = [];
+            this.projectDocumentsLoaded = false;
             this.projectDocsError = '';
             this.projectExtractingDocName = '';
             this.projectExtractWarning = '';
@@ -3868,19 +4561,22 @@ const AtlasPage = {
         },
         openPublicationFromProject(id) {
             this.closeProjectDrawer();
-            this.tab = 'veroeffentlichungen';
-            this.selectPublication(id);
+            this.$router.push(atlasPublicationRoute(id));
         },
         openProjectFromPublication(id) {
             this.closePublicationDrawer();
-            this.tab = 'projekte';
+            this.goTab('projekte');
             this.selectProject(id);
         },
         // --- Projektdokumente (Issue #49) ------------------------------------
+        // `projectDocumentsLoaded`: die Liste gilt erst nach einem gelungenen
+        // Laden — davor (oder nach einem Fehler) ist die Zahl unbekannt.
         async loadProjectDocuments(id) {
+            this.projectDocumentsLoaded = false;
             try {
                 const d = await api(`/api/plugins/atlas/projects/${encodeURIComponent(id)}/documents`);
                 this.projectDocuments = d.documents || [];
+                this.projectDocumentsLoaded = true;
             } catch (e) {
                 this.projectDocuments = [];
             }
@@ -4113,7 +4809,9 @@ const AtlasPage = {
             const id = this.selectedProjectId;
             if (!id || this.savingProject) return;
             const proj = this.selectedProject;
-            if (!confirm(`Projekt „${(proj && proj.title) || id}" wirklich löschen? Die Markdown-Datei wird entfernt (hochgeladene Dokumente im Projektordner bleiben erhalten).`)) return;
+            const count = this.projectDocumentsLoaded ? this.projectDocuments.length : null;  // null: unbekannt
+            const kept = atlasDocumentsKeptNote(count, 'projekte/' + id);
+            if (!confirm(`Projekt „${(proj && proj.title) || id}" wirklich löschen? Die Markdown-Datei wird entfernt.` + kept)) return;
             this.savingProject = true;
             this.projectError = '';
             try {
@@ -4121,8 +4819,8 @@ const AtlasPage = {
                 this.closeProjectDrawer();
                 await this.loadProjects();
             } catch (e) {
-                this.projectError = e.message;
-                alert('Löschen fehlgeschlagen: ' + e.message);
+                this.projectError = atlasErrorText(e);
+                alert('Löschen fehlgeschlagen: ' + atlasErrorText(e));
             } finally {
                 this.savingProject = false;
             }
@@ -4274,7 +4972,7 @@ const AtlasPage = {
                 });
                 this.showPublicationCreate = false;
                 await this.loadPublications();
-                this.selectPublication(created.id);
+                this.$router.push(atlasPublicationRoute(created.id));
             } catch (e) {
                 this.publicationError = e.message;
             } finally {
@@ -4312,25 +5010,31 @@ const AtlasPage = {
             try {
                 const splitLines = (s) => s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
                 const tags = this.publicationEdit.tags.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
+                const payload = {
+                    title: this.publicationEdit.title.trim(),
+                    status: this.publicationEdit.status,
+                    type: this.publicationEdit.type || null,
+                    venue: this.publicationEdit.venue.trim() || null,
+                    authors: splitLines(this.publicationEdit.authors),
+                    due: this.publicationEdit.due || null,
+                    submitted: this.publicationEdit.submitted || null,
+                    published: this.publicationEdit.published || null,
+                    tags,
+                    refs: splitLines(this.publicationEdit.refs),
+                    derived_from: splitLines(this.publicationEdit.derived_from),
+                    manuscripts: splitLines(this.publicationEdit.manuscripts),
+                    projects: splitLines(this.publicationEdit.projects),
+                    paper: this.publicationEdit.paper.trim() || null,
+                    body: this.publicationEdit.body,
+                };
+                // Sammlungs-Eintrag (ADR-0022): die Literatur ist die Sammlung —
+                // nie refs in die Atlas-Datei. Der erste Speichervorgang legt die
+                // Datei an.
+                const pub = this.selectedPublication;
+                if (pub && pub.collection) delete payload.refs;
                 await api(`/api/plugins/atlas/publications/${encodeURIComponent(this.selectedPublicationId)}`, {
                     method: 'PUT',
-                    body: JSON.stringify({
-                        title: this.publicationEdit.title.trim(),
-                        status: this.publicationEdit.status,
-                        type: this.publicationEdit.type || null,
-                        venue: this.publicationEdit.venue.trim() || null,
-                        authors: splitLines(this.publicationEdit.authors),
-                        due: this.publicationEdit.due || null,
-                        submitted: this.publicationEdit.submitted || null,
-                        published: this.publicationEdit.published || null,
-                        tags,
-                        refs: splitLines(this.publicationEdit.refs),
-                        derived_from: splitLines(this.publicationEdit.derived_from),
-                        manuscripts: splitLines(this.publicationEdit.manuscripts),
-                        projects: splitLines(this.publicationEdit.projects),
-                        paper: this.publicationEdit.paper.trim() || null,
-                        body: this.publicationEdit.body,
-                    }),
+                    body: JSON.stringify(payload),
                 });
                 this.publicationEditing = false;
                 await this.loadPublications();
@@ -4344,22 +5048,32 @@ const AtlasPage = {
         async deletePublication() {
             const p = this.selectedPublication;
             if (!p || this.savingPublication) return;
-            if (!confirm(`Veröffentlichung „${p.title}" wirklich löschen? Die Markdown-Datei wird entfernt.`)) return;
+            // Sperre schon vor der Rückfrage: ein Doppelklick löscht nicht zweimal.
             this.savingPublication = true;
+            // Das Formular kennt den Dokumentordner nicht — einmal fragen.
+            const count = await atlasDocumentCount(`/api/plugins/atlas/publications/${encodeURIComponent(p.id)}/documents`);
+            const question = (p.collection
+                ? `Atlas-Angaben zu „${p.title}" löschen? Die Markdown-Datei wird entfernt — die Sammlung und ihre Literatur im Kern bleiben.`
+                : `Veröffentlichung „${p.title}" wirklich löschen? Die Markdown-Datei wird entfernt.`)
+                + atlasDocumentsKeptNote(count, 'veroeffentlichungen/' + p.id);
+            if (!confirm(question)) {
+                this.savingPublication = false;
+                return;
+            }
             this.publicationError = '';
             try {
                 await api(`/api/plugins/atlas/publications/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
                 this.closePublicationDrawer();
                 await this.loadPublications();
             } catch (e) {
-                this.publicationError = e.message;
+                this.publicationError = atlasErrorText(e);
             } finally {
                 this.savingPublication = false;
             }
         },
         openIdeaFromPublication(id) {
             this.selectedPublicationId = null;
-            this.tab = 'ideen';
+            this.goTab('ideen');
             this.selectedId = id;
         },
         openManuscriptFromPublication(id) {
@@ -4415,6 +5129,51 @@ const AtlasPage = {
                 this.openManuscriptFromPublication(created.id);
             } catch (e) {
                 this.manuscriptUploadError = e.message;
+            }
+        },
+        // --- Sammlungs-Einträge (ADR-0022, Issue #205) -----------------------
+        // Die Literatur wird im Kern gepflegt: der Link führt auf die
+        // Sammlungsseite des Kerns.
+        openCollectionInCore(entry) {
+            if (!entry || !entry.collection) return;
+            this.$router.push(entry.collection.edit_route || ('/collection/' + entry.collection.id));
+        },
+        // „Zu Forschungsprojekt verschieben" / „Zur Veröffentlichung
+        // verschieben": erst die Vorschau (welche Felder in den Abschnitt
+        // „Aus … übernommen" wandern), dann bestätigen, dann verschieben.
+        async switchCollectionKind(entry, to) {
+            if (!entry || !entry.collection) return;
+            const cid = entry.collection.id;
+            const base = `/api/plugins/atlas/collections/${encodeURIComponent(cid)}/switch`;
+            const target = to === 'project' ? 'Forschungsprojekt' : 'Veröffentlichung';
+            try {
+                const plan = await api(`${base}?to=${encodeURIComponent(to)}`);
+                const lines = [`„${entry.title}" zum ${target} verschieben?`, ''];
+                if (!plan.has_file) {
+                    lines.push('Es gibt noch keine Atlas-Angaben — nur der Typ ändert sich.');
+                } else {
+                    lines.push(`Übernommen: ${(plan.moved || []).join(', ')}.`);
+                    if ((plan.carried || []).length) {
+                        lines.push('', `Ohne Gegenstück — wandert als Abschnitt „${plan.section} (Datum)" in die Notizen:`);
+                        plan.carried.forEach((c) => lines.push(`• ${c.label}: ${c.value}`));
+                    } else {
+                        lines.push('Keine Felder ohne Gegenstück.');
+                    }
+                }
+                lines.push('', 'Die Literatur bleibt in der Sammlung.');
+                if (!confirm(lines.join('\n'))) return;
+                const res = await api(base, { method: 'POST', body: JSON.stringify({ to }) });
+                this.closePublicationDrawer();
+                this.closeProjectDrawer();
+                await Promise.all([this.loadPublications(), this.loadProjects()]);
+                if (res.kind === 'project') {
+                    this.goTab('projekte');
+                    this.selectProject(res.id);
+                } else {
+                    this.$router.push(atlasPublicationRoute(res.id));
+                }
+            } catch (e) {
+                alert('Verschieben fehlgeschlagen: ' + atlasErrorText(e));
             }
         },
         // --- BibTeX-Import (CONTEXT.md "BibTeX Import") ----------------------
@@ -4491,16 +5250,22 @@ const AtlasPage = {
                     matched_paper_id: e.match ? e.match.paper_id : null,
                     raw: e.raw || {},
                 }));
+                // Sammlungs-Eintrag (ADR-0022): der Kern-Import nimmt die
+                // Zielsammlung selbst — Atlas schreibt keine refs.
+                const pub = this.selectedPublication;
+                const collectionId = pub && pub.collection ? pub.collection.id : null;
+                const commit = {
+                    entries: payload,
+                    source_name: this.bibtexBibFile ? this.bibtexBibFile.name : '',
+                };
+                if (collectionId) commit.collection_id = collectionId;
                 const data = await api('/api/import/bibtex/commit', {
-                    method: 'POST', body: JSON.stringify({
-                        entries: payload,
-                        source_name: this.bibtexBibFile ? this.bibtexBibFile.name : '',
-                    }),
+                    method: 'POST', body: JSON.stringify(commit),
                 });
                 this.bibtexCommitSummary = data;
                 const ok = (data.results || []).filter((r) => r.status === 'created' || r.status === 'matched');
                 // Cite Keys an die Veröffentlichung haengen (refs, ADR-0003/ADR-0004)
-                if (ok.length) {
+                if (ok.length && !collectionId) {
                     await api(`/api/plugins/atlas/publications/${encodeURIComponent(this.selectedPublicationId)}/refs`, {
                         method: 'POST',
                         body: JSON.stringify({ refs: ok.map((r) => r.cite_key) }),
@@ -4557,8 +5322,11 @@ const AtlasPage = {
                     method: 'POST', body: JSON.stringify({ paper_ids: ids }),
                 });
                 // Cite Keys aus den Refs der Veröffentlichung nehmen (keine hängenden Verweise).
+                // (Bei einer Sammlung entfernt der Kern die gelöschten Einträge
+                // selbst aus ihr — dort gibt es keine refs zu bereinigen.)
                 const citeKeys = new Set(created.map((r) => r.cite_key).filter(Boolean));
-                if (citeKeys.size && this.selectedPublicationId) {
+                const inCollection = !!(this.selectedPublication && this.selectedPublication.collection);
+                if (citeKeys.size && this.selectedPublicationId && !inCollection) {
                     try {
                         const pub = await api(`/api/plugins/atlas/publications/${encodeURIComponent(this.selectedPublicationId)}`);
                         const remaining = (pub.refs || []).filter((c) => !citeKeys.has(c));
@@ -4604,6 +5372,8 @@ const AtlasPage = {
         '$route.query.chapter'() { this.applyRouteIdea(); },
         '$route.query.tab'() { this.applyRouteIdea(); },
         '$route.query.focus'() { this.applyRouteIdea(); },
+        '$route.query.manuscript'() { this.applyRouteIdea(); },
+        '$route.query.legacy'() { this.applyRouteIdea(); },
         selectedId() { this.editing = false; this.resetMatch(); },  // switching ideas exits edit mode + stale proposals
         tab(val) {
             if (val === 'dissertation') this.loadDiss();
@@ -4639,16 +5409,38 @@ const ATLAS_ERROR_TEXT = {
     'error.atlas.week_invalid': 'Ungültige Kalenderwoche.',
     'error.atlas.date_invalid': 'Ungültiges Datum.',
     'error.atlas.day_outside_week': 'Der Tag liegt außerhalb dieser Woche.',
-    'error.atlas.task_not_found': 'Der Task existiert nicht mehr — die Ansicht wird neu geladen.',
-    'error.atlas.task_text_required': 'Ein Task braucht Text.',
+    'error.atlas.task_not_found': 'Die Aufgabe existiert nicht mehr — die Ansicht wird neu geladen.',
+    'error.atlas.task_text_required': 'Eine Aufgabe braucht Text.',
     'error.atlas.goal_not_found': 'Das Wochenziel existiert nicht mehr.',
     'error.atlas.goals_too_many': 'Höchstens fünf Wochenziele je Woche.',
     'error.atlas.goal_title_required': 'Ein Wochenziel braucht einen Titel.',
     'error.atlas.title_required': 'Ein Titel ist Pflicht.',
-    'error.atlas.zettel_not_found': 'Der Zettel existiert nicht mehr.',
+    'error.atlas.zettel_not_found': 'Die Notiz existiert nicht mehr.',
     'error.atlas.checklist_index_invalid': 'Dieser Checklisten-Punkt existiert nicht mehr.',
-    'error.atlas.already_promoted': 'Aus diesem Zettel ist bereits eine Idee entstanden.',
+    'error.atlas.already_promoted': 'Aus dieser Notiz ist bereits eine Idee entstanden.',
     'error.atlas.invalid_request': 'Die Anfrage passt nicht zum Journal.',
+    'error.atlas.move_changed': 'Die Aufgabe wurde seither geändert – zieh sie einfach zurück.',
+    // Sammlungs-Einträge (ADR-0022, Issue #205)
+    'error.atlas.collection_not_found': 'Die Sammlung gibt es nicht (mehr).',
+    'error.atlas.kind_invalid': 'Unbekannter Eintragstyp.',
+    'error.atlas.kind_unchanged': 'Der Eintrag hat diesen Typ bereits.',
+    'error.atlas.collection_refs_readonly': 'Die Literatur einer Sammlung wird im Kern gepflegt.',
+    // Pipeline und „Aus Sammlung planen" (#225, ADR-0025)
+    'error.atlas.publication_not_found': 'Diese Veröffentlichung gibt es nicht (mehr).',
+    'error.atlas.status_invalid': 'Unbekannter Status.',
+    'error.atlas.collection_already_planned': 'Diese Sammlung ist schon eine Veröffentlichung.',
+    'error.atlas.collection_not_planned': 'Diese Sammlung ist keine Veröffentlichung.',
+    'error.atlas.publication_has_collection': 'Diese Veröffentlichung hat schon eine Sammlung.',
+    'error.atlas.project_not_found': 'Dieses Forschungsprojekt gibt es nicht (mehr).',
+    'error.atlas.project_has_collection': 'Dieses Forschungsprojekt hat schon eine Sammlung.',
+    // Detailseite (#226)
+    'error.atlas.filename_invalid': 'Dieser Dateiname geht nicht (Sonderzeichen oder Punkt am Anfang).',
+    'error.atlas.document_not_found': 'Diese Datei liegt nicht (mehr) im Ordner.',
+    'error.atlas.document_locked': 'Die Datei ist gesperrt (z. B. OneDrive-Sync oder in einem Programm geöffnet).',
+    // Publikationsliste (#228)
+    'error.atlas.style_invalid': 'Unbekannter Zitierstil.',
+    'error.atlas.selection_invalid': 'Unbekannte Auswahl.',
+    'error.atlas.format_invalid': 'Unbekanntes Exportformat.',
 };
 
 function atlasErrorText(err) {
@@ -4656,146 +5448,278 @@ function atlasErrorText(err) {
     return ATLAS_ERROR_TEXT[msg] || msg;
 }
 
-// ── Heute (Story 1–19) ──────────────────────────────────────────────────────
-// Der Tagesplan ist die Startseite des Plugins (Story 58): links die Tasks des
-// Tages und der Block „offen von gestern", rechts Wochenziele, „Was liegt an"
-// und die zuletzt geschriebenen Zettel. Nachladen läuft still (kein Spinner,
-// keine Sprünge) — die Seite hängt an denselben SSE-Ereignissen wie der
-// Watcher, ein externer Editor-Edit erscheint also von selbst (Story 60).
-const AtlasTodayPage = {
+// ── Übersicht (#223) ────────────────────────────────────────────────────────
+// Die Startseite von Atlas: Kennzahlen (heute, diese Woche, Dissertation,
+// nächster Termin), die Aufgaben von heute samt „Liegen geblieben",
+// Wochenziele, „Demnächst" und „Zuletzt notiert". Sie setzt sich nur aus
+// bestehenden Lesepfaden zusammen (Journal heute und Woche, Kapitel-Liste,
+// „Was liegt an" im Journal von heute) und lädt bei Watcher-Ereignissen still
+// nach — ein externer Editor-Edit erscheint von selbst.
+const ATLAS_CAPTURE_PLACEHOLDER = {
+    task: 'Neue Aufgabe für heute … z. B. Abb. 4.2 überarbeiten [[kapitel-04]] #methodik',
+    zettel: 'Titel der Notiz … z. B. Müller 2023 – Kalibrierverfahren',
+    idee: 'Titel der Idee … z. B. Surrogatmodell für die Parameterstudie',
+};
+
+const ATLAS_DISS_DONE = new Set(['submitted', 'published']);
+
+const AtlasOverviewPage = {
     components: {
         'atlas-nav': AtlasNav,
+        'atlas-header': AtlasHeader,
         'atlas-capture': AtlasCapture,
-        'atlas-task-row': AtlasTaskRow,
+        'atlas-anchor-chip': AtlasAnchorChip,
+        'atlas-icon': AtlasIcon,
     },
     template: `
-        <div class="p-6 atlas-page">
+        <div class="atlas-page atlas-shell" lang="de">
+            <atlas-header :kicker="kicker" :title="headline" :subtitle="summary" search :search-tasks="weekTasks" />
             <atlas-nav active="heute" />
-
-            <div class="atlas-head">
-                <div>
-                    <div class="atlas-kicker">
-                        <template v-if="data">KW {{ weekNumber }} · Tag {{ dayIndex }} von 7</template>
-                        <template v-else>Atlas · Werkbank</template>
-                    </div>
-                    <h1 class="atlas-title">{{ headline }}</h1>
-                </div>
-                <div class="atlas-actions">
-                    <button type="button" class="atlas-pill" :disabled="busyJournal || !data" @click="openJournal">
-                        {{ busyJournal ? 'Öffnet…' : 'Journal öffnen' }}
-                    </button>
-                    <button type="button" class="atlas-pill" :disabled="busyReindex" @click="reindex">
-                        {{ busyReindex ? 'Reindex läuft…' : 'Reindex' }}
-                    </button>
-                </div>
-            </div>
 
             <atlas-capture @created="onCaptured" />
 
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
-                <div class="lg:col-span-2 flex flex-col gap-5 min-w-0">
-                    <section class="atlas-sec">
-                        <div class="atlas-sec-head">
-                            <h2 class="atlas-sec-title">Heute · {{ doneCount }} von {{ tasks.length }} erledigt</h2>
-                            <span class="atlas-sec-note">Reihenfolge = Reihenfolge in der Datei</span>
+            <section class="atlas-tiles" aria-label="Auf einen Blick">
+                <div class="atlas-tile">
+                    <div class="atlas-kicker">Heute</div>
+                    <div class="atlas-tile-num"><span>{{ todayDone.length }}</span><span class="atlas-tile-of">/ {{ todayAll.length }}</span></div>
+                    <div class="atlas-tile-text">Aufgaben erledigt</div>
+                    <div class="atlas-meter" role="img" :aria-label="todayDone.length + ' von ' + todayAll.length + ' Aufgaben erledigt'">
+                        <div class="atlas-meter-fill" :style="{ width: todayPct }"></div>
+                    </div>
+                </div>
+
+                <div class="atlas-tile">
+                    <div class="atlas-tile-head">
+                        <div class="atlas-kicker">Diese Woche</div>
+                        <div class="atlas-legend">
+                            <span><i class="atlas-swatch is-accent"></i>erledigt</span>
+                            <span><i class="atlas-swatch is-open"></i>offen</span>
                         </div>
-                        <div class="atlas-card">
-                            <div v-if="loading" class="p-4 flex flex-col gap-3" aria-hidden="true">
-                                <div v-for="n in 3" :key="n" class="atlas-skel" style="height:20px"></div>
+                    </div>
+                    <div class="atlas-tile-split">
+                        <div>
+                            <div class="atlas-tile-num"><span>{{ weekDone }}</span><span class="atlas-tile-of">/ {{ weekTotal }}</span></div>
+                            <div class="atlas-tile-text" style="margin-top:8px">Aufgaben erledigt</div>
+                        </div>
+                        <div class="atlas-weekbars" role="img" aria-label="Aufgaben je Wochentag, erledigt und offen">
+                            <div v-for="b in weekBars" :key="b.date" class="atlas-weekbar" :title="b.title">
+                                <div class="atlas-weekbar-stack">
+                                    <div v-if="b.open" class="atlas-weekbar-open" :style="{ height: b.openH }"></div>
+                                    <div v-if="b.done" class="atlas-weekbar-done" :class="{ 'is-top': !b.open }" :style="{ height: b.doneH }"></div>
+                                    <div v-if="!b.total" class="atlas-weekbar-empty"></div>
+                                </div>
+                                <span class="atlas-weekbar-label" :class="{ 'is-today': b.today }">{{ b.label }}</span>
                             </div>
-                            <p v-else-if="!tasks.length" class="atlas-empty">
-                                Noch nichts für heute. Schreib die erste Zeile oben ins Erfassen-Feld —
-                                Anker per <code>[[id]]</code>, Schlagwort per <code>#tag</code>.
-                            </p>
-                            <template v-else>
-                                <atlas-task-row v-for="(task, i) in tasks" :key="taskKey(task)"
-                                                :task="task" :first="i === 0" :last="i === tasks.length - 1"
-                                                :pending="pending === taskKey(task)"
-                                                @toggle="toggle(task)"
-                                                @save="(text) => saveText(task, text)"
-                                                @remove="remove(task)"
-                                                @move-up="reorder(task, i - 1)"
-                                                @move-down="reorder(task, i + 1)" />
-                            </template>
                         </div>
+                    </div>
+                </div>
+
+                <div class="atlas-tile">
+                    <div class="atlas-kicker">Dissertation</div>
+                    <template v-if="chapters.length">
+                        <div class="atlas-tile-num"><span>{{ diss.done }}</span><span class="atlas-tile-of">/ {{ chapters.length }}</span></div>
+                        <div class="atlas-tile-text">Kapitel fertig, {{ diss.draft }} im Entwurf</div>
+                        <div class="atlas-segbar" role="img"
+                             :aria-label="chapters.length + ' Kapitel: ' + diss.done + ' fertig, ' + diss.draft + ' im Entwurf, ' + diss.open + ' offen'">
+                            <div v-for="(c, i) in dissBar" :key="i" class="atlas-segbar-part" :class="'is-' + c"></div>
+                        </div>
+                        <div class="atlas-legend">
+                            <span><i class="atlas-swatch is-done"></i>fertig {{ diss.done }}</span>
+                            <span><i class="atlas-swatch is-accent"></i>Entwurf {{ diss.draft }}</span>
+                            <span><i class="atlas-swatch is-open"></i>offen {{ diss.open }}</span>
+                        </div>
+                    </template>
+                    <template v-else>
+                        <div class="atlas-tile-num"><span>0</span></div>
+                        <div class="atlas-tile-text">Noch keine Kapitel.</div>
+                        <router-link to="/atlas/sammlung?tab=dissertation" class="atlas-tile-foot">Gliederung anlegen</router-link>
+                    </template>
+                </div>
+
+                <div class="atlas-tile">
+                    <div class="atlas-kicker">Nächster Termin</div>
+                    <template v-if="nextTermin">
+                        <div class="atlas-tile-big">{{ inDays(nextTermin.days) }}</div>
+                        <div class="atlas-tile-strong">{{ nextTermin.title }}</div>
+                        <div class="atlas-tile-sub">{{ dayLabel(nextTermin.date) }} · {{ nextTermin.what }}</div>
+                    </template>
+                    <template v-else>
+                        <div class="atlas-tile-big">frei</div>
+                        <div class="atlas-tile-sub">Kein Termin in den nächsten 14 Tagen.</div>
+                    </template>
+                    <router-link v-if="overdue.length" :to="overdue[0].to" class="atlas-tile-foot is-danger">
+                        <atlas-icon name="alert" :size="16" />
+                        {{ overdue.length }} {{ overdue.length === 1 ? 'Termin' : 'Termine' }} überfällig – neu planen
+                    </router-link>
+                </div>
+            </section>
+
+            <div class="atlas-columns">
+                <div class="atlas-col-main">
+                    <section class="atlas-panel" aria-labelledby="atlas-h-heute">
+                        <div class="atlas-panel-head">
+                            <div class="atlas-panel-title-row">
+                                <h2 id="atlas-h-heute" class="atlas-panel-title">Heute</h2>
+                                <span class="atlas-muted">{{ todayDone.length }} von {{ todayAll.length }} erledigt</span>
+                            </div>
+                            <router-link to="/atlas/woche" class="atlas-more">Ganze Woche ansehen <atlas-icon name="arrow" :size="16" /></router-link>
+                        </div>
+                        <div v-if="loading" class="atlas-panel-pad" aria-hidden="true">
+                            <div v-for="n in 3" :key="n" class="atlas-skel" style="height:20px;margin-bottom:10px"></div>
+                        </div>
+                        <template v-else>
+                            <ul class="atlas-todo">
+                                <li v-for="t in todayOpen" :key="taskKey(t)" class="atlas-todo-row" :class="{ 'is-pending': pending === taskKey(t) }">
+                                    <input :id="'atlas-cb-' + taskKey(t)" type="checkbox" class="atlas-check" :checked="t.done" @change="toggle(t)" />
+                                    <label :for="'atlas-cb-' + taskKey(t)" class="atlas-todo-text">{{ t.text || '(leere Zeile)' }}</label>
+                                    <atlas-anchor-chip v-for="a in t.anchors" :key="a" :id="a" />
+                                    <span v-for="tag in t.tags" :key="tag" class="atlas-tag">#{{ tag }}</span>
+                                </li>
+                                <li v-if="!todayAll.length" class="atlas-todo-empty">
+                                    Noch nichts für heute. Schreib die erste Zeile oben ins Erfassen-Feld —
+                                    Anker per <code>[[id]]</code>, Schlagwort per <code>#tag</code>.
+                                </li>
+                                <li v-else-if="!todayOpen.length" class="atlas-todo-empty">Alles erledigt für heute.</li>
+                            </ul>
+
+                            <div v-if="carry.length" class="atlas-carry">
+                                <div class="atlas-carry-head">
+                                    <h3 class="atlas-carry-title"><atlas-icon name="clock" :size="16" /> Liegen geblieben · {{ carry.length }}</h3>
+                                    <button type="button" class="atlas-btn is-small" :disabled="busyCarry" @click="carryAll">
+                                        {{ busyCarry ? 'Holt…' : 'Alle auf heute holen' }}
+                                    </button>
+                                </div>
+                                <ul class="atlas-carry-list">
+                                    <li v-for="t in carry" :key="taskKey(t)" class="atlas-carry-row" :class="{ 'is-pending': pending === taskKey(t) }">
+                                        <span class="atlas-carry-text">{{ t.text }}</span>
+                                        <span class="atlas-mono-sub">seit {{ shortDay(t.day) }} {{ dayNum(t.day) }}.</span>
+                                        <button type="button" class="atlas-text-btn" @click="carryOne(t)">Auf heute</button>
+                                    </li>
+                                </ul>
+                            </div>
+
+                            <template v-if="todayDone.length">
+                                <div class="atlas-kicker atlas-panel-sub">Erledigt · {{ todayDone.length }}</div>
+                                <ul class="atlas-todo is-done">
+                                    <li v-for="t in todayDone" :key="taskKey(t)" class="atlas-todo-row is-done">
+                                        <input :id="'atlas-cb-' + taskKey(t)" type="checkbox" class="atlas-check" :checked="t.done" @change="toggle(t)" />
+                                        <label :for="'atlas-cb-' + taskKey(t)" class="atlas-todo-text">{{ t.text }}</label>
+                                    </li>
+                                </ul>
+                            </template>
+                        </template>
                     </section>
 
-                    <section v-if="carryOver.length" class="atlas-sec">
-                        <div class="atlas-sec-head">
-                            <h2 class="atlas-sec-title">Offen von gestern · {{ carryOver.length }}</h2>
-                            <button type="button" class="atlas-link-btn" :disabled="busyCarry" @click="carryAll">
-                                {{ busyCarry ? 'Überträgt…' : 'Alle übertragen' }}
+                    <section class="atlas-panel" aria-labelledby="atlas-h-ziele">
+                        <div class="atlas-panel-head">
+                            <div class="atlas-panel-title-row">
+                                <h2 id="atlas-h-ziele" class="atlas-panel-title">Wochenziele</h2>
+                                <span v-if="goals.length" class="atlas-muted">{{ goalsReached }} von {{ goals.length }} erreicht</span>
+                            </div>
+                            <button v-if="goals.length < 5" type="button" class="atlas-btn is-small" @click="startGoal">
+                                <atlas-icon name="plus" :size="16" /> Ziel hinzufügen
                             </button>
                         </div>
-                        <div class="atlas-card">
-                            <atlas-task-row v-for="task in carryOver" :key="taskKey(task)"
-                                            :task="task" :reorderable="false" carryable
-                                            :pending="pending === taskKey(task)"
-                                            @toggle="toggle(task)"
-                                            @save="(text) => saveText(task, text)"
-                                            @remove="remove(task)"
-                                            @carry="carryOne(task)" />
-                        </div>
+                        <form v-if="addingGoal" class="atlas-goal-form" @submit.prevent="saveGoal">
+                            <label for="atlas-goal-new" class="atlas-sr">Neues Wochenziel</label>
+                            <input id="atlas-goal-new" ref="goalInput" v-model="goalDraft" type="text" class="atlas-input"
+                                   placeholder="z. B. Kapitel 3 an die Betreuerin schicken [[kapitel-03]]" @keydown.esc="addingGoal = false" />
+                            <button type="submit" class="atlas-btn is-primary is-small" :disabled="!goalDraft.trim() || busyGoal">Hinzufügen</button>
+                            <button type="button" class="atlas-btn is-small" @click="addingGoal = false">Abbrechen</button>
+                        </form>
+                        <p v-if="!goals.length && !addingGoal" class="atlas-panel-pad atlas-muted">
+                            Noch keine Wochenziele. Bis zu fünf halten fest, worauf es diese Woche ankommt.
+                        </p>
+                        <ul v-else-if="goals.length" class="atlas-goal-grid">
+                            <li v-for="g in goals" :key="g.index" class="atlas-goal-card">
+                                <div class="atlas-goal-card-title">{{ g.title }}</div>
+                                <div class="atlas-meter is-thin"><div class="atlas-meter-fill" :class="{ 'is-ok': goalReached(g) }" :style="{ width: goalPercent(g) }"></div></div>
+                                <div class="atlas-goal-card-foot">
+                                    <atlas-anchor-chip v-if="g.anchor" :id="g.anchor" />
+                                    <span v-else-if="g.tag" class="atlas-tag">#{{ g.tag }}</span>
+                                    <span v-else></span>
+                                    <span v-if="goalReached(g)" class="atlas-reached"><atlas-icon name="check" :size="15" /> erreicht</span>
+                                    <span v-else-if="g.total" class="atlas-mono-sub is-ink">{{ g.done_count }} / {{ g.total }} Aufgaben</span>
+                                    <span v-else class="atlas-mono-sub">offen</span>
+                                </div>
+                            </li>
+                        </ul>
                     </section>
                 </div>
 
-                <aside class="flex flex-col gap-5 min-w-0">
-                    <section class="atlas-sec">
-                        <div class="atlas-sec-head">
-                            <h2 class="atlas-sec-title">Wochenziele</h2>
-                            <router-link to="/atlas/woche" class="atlas-link-btn" style="text-decoration:none">bearbeiten</router-link>
+                <aside class="atlas-col-side">
+                    <section class="atlas-panel is-padded" aria-labelledby="atlas-h-demn">
+                        <div class="atlas-panel-head is-flush">
+                            <h2 id="atlas-h-demn" class="atlas-panel-title">Demnächst</h2>
+                            <router-link to="/atlas/woche" class="atlas-more">Kalender</router-link>
                         </div>
-                        <div v-if="loading" class="atlas-skel" style="height:64px"></div>
-                        <div v-else-if="!goals.length" class="atlas-card atlas-empty">
-                            Keine Wochenziele. In der Wochenansicht lassen sich bis zu fünf setzen.
-                        </div>
-                        <div v-else class="flex flex-col gap-2">
-                            <div v-for="goal in goals" :key="goal.index" class="atlas-goal">
-                                <div class="atlas-goal-head">
-                                    <span class="atlas-goal-title">{{ goal.title }}</span>
-                                    <span class="atlas-goal-count" :class="{ 'is-done': goalReached(goal) }">{{ goalCount(goal) }}</span>
-                                </div>
-                                <div class="atlas-bar">
-                                    <div class="atlas-bar-fill" :class="{ 'is-done': goalReached(goal) }"
-                                         :style="{ width: goalPercent(goal) }"></div>
-                                </div>
-                            </div>
-                        </div>
+                        <p v-if="!loading && !overdue.length && !soon.length && !still.length" class="atlas-muted" style="margin-top:12px">
+                            Nichts überfällig, nichts in den nächsten 14 Tagen.
+                        </p>
+                        <template v-if="overdue.length">
+                            <div class="atlas-group-label is-danger">Überfällig</div>
+                            <ul class="atlas-agenda">
+                                <li v-for="item in overdue" :key="item.key" class="atlas-agenda-row">
+                                    <span class="atlas-agenda-icon is-danger"><atlas-icon name="alert" /></span>
+                                    <div class="atlas-agenda-body">
+                                        <div class="atlas-agenda-title">{{ item.title }}</div>
+                                        <div class="atlas-agenda-sub">{{ item.what }} · überfällig, fällig war {{ dayLabel(item.date) }}</div>
+                                    </div>
+                                    <router-link :to="item.to" class="atlas-replan">Neu planen</router-link>
+                                </li>
+                            </ul>
+                        </template>
+                        <template v-if="soon.length">
+                            <div class="atlas-group-label">Nächste 14 Tage</div>
+                            <ul class="atlas-agenda">
+                                <li v-for="item in soon" :key="item.key" class="atlas-agenda-row">
+                                    <span class="atlas-agenda-icon is-accent"><atlas-icon name="flag" /></span>
+                                    <div class="atlas-agenda-body">
+                                        <router-link v-if="item.open" :to="item.open" class="atlas-agenda-title">{{ item.title }}</router-link>
+                                        <div v-else class="atlas-agenda-title">{{ item.title }}</div>
+                                        <div class="atlas-agenda-sub">{{ item.what }}</div>
+                                    </div>
+                                    <div class="atlas-agenda-when">
+                                        <div class="atlas-agenda-date">{{ dayLabel(item.date) }}</div>
+                                        <div class="atlas-agenda-sub">{{ inDays(item.days) }}</div>
+                                    </div>
+                                </li>
+                            </ul>
+                        </template>
+                        <template v-if="still.length">
+                            <div class="atlas-group-label">Liegt still</div>
+                            <ul class="atlas-agenda">
+                                <li v-for="item in still" :key="item.key" class="atlas-agenda-row">
+                                    <span class="atlas-agenda-icon"><atlas-icon :name="item.icon" /></span>
+                                    <div class="atlas-agenda-body">
+                                        <router-link :to="item.to" class="atlas-agenda-title">{{ item.title }}</router-link>
+                                        <div class="atlas-agenda-sub">{{ item.note }}</div>
+                                    </div>
+                                </li>
+                            </ul>
+                        </template>
                     </section>
 
-                    <section class="atlas-sec">
-                        <h2 class="atlas-sec-title">Was liegt an</h2>
-                        <div v-if="loading" class="atlas-skel" style="height:64px"></div>
-                        <div v-else class="atlas-card">
-                            <p v-if="!dueItems.length" class="atlas-empty">Nichts überfällig. Keine Frist in den nächsten sieben Tagen.</p>
-                            <div v-for="item in dueItems" :key="item.key" class="atlas-due">
-                                <span class="atlas-due-dot" :class="{ 'is-overdue': item.overdue }"></span>
-                                <div class="min-w-0">
-                                    <router-link v-if="item.to" :to="item.to">{{ item.title }}</router-link>
-                                    <strong v-else>{{ item.title }}</strong>
-                                    <div class="atlas-due-sub">{{ item.note }}</div>
-                                </div>
-                            </div>
+                    <section class="atlas-panel is-padded" aria-labelledby="atlas-h-notiz">
+                        <div class="atlas-panel-head is-flush">
+                            <h2 id="atlas-h-notiz" class="atlas-panel-title">Zuletzt notiert</h2>
+                            <router-link to="/atlas/zettel" class="atlas-more">Alle Notizen</router-link>
                         </div>
+                        <p class="atlas-panel-note">Notizen halten fest, was du gelesen, besprochen oder entschieden hast.</p>
+                        <p v-if="!loading && !zettel.length" class="atlas-muted">
+                            Noch keine Notiz. Das Erfassen-Feld legt im Modus „Notiz" eine an.
+                        </p>
+                        <ul v-else class="atlas-notes">
+                            <li v-for="z in zettel" :key="z.id" class="atlas-notes-row">
+                                <span class="atlas-notes-kind"><span class="atlas-badge">{{ noteKind(z.type) }}</span></span>
+                                <router-link :to="'/atlas/zettel/' + encodeURIComponent(z.id)" class="atlas-notes-title">{{ z.title }}</router-link>
+                                <span class="atlas-notes-when">{{ when(z.date) }}</span>
+                            </li>
+                        </ul>
                     </section>
-
-                    <section class="atlas-sec">
-                        <div class="atlas-sec-head">
-                            <h2 class="atlas-sec-title">Zuletzt notiert</h2>
-                            <router-link to="/atlas/zettel" class="atlas-link-btn" style="text-decoration:none">alle</router-link>
-                        </div>
-                        <div v-if="loading" class="atlas-skel" style="height:48px"></div>
-                        <div v-else-if="!zettel.length" class="atlas-card atlas-empty">
-                            Noch kein Zettel. Das Erfassen-Feld legt im Modus „Zettel" einen an.
-                        </div>
-                        <div v-else class="flex flex-col gap-1.5 text-[13px]">
-                            <div v-for="z in zettel" :key="z.id" class="flex justify-between gap-3">
-                                <router-link :to="'/atlas/zettel/' + encodeURIComponent(z.id)"
-                                             class="text-ink hover:text-accent truncate" style="text-decoration:none">{{ z.title }}</router-link>
-                                <span class="text-mute whitespace-nowrap">{{ shortDate(z.date) }}</span>
-                            </div>
-                        </div>
-                    </section>
+                    <button type="button" class="atlas-text-btn is-muted" style="align-self:flex-end" :disabled="busyReindex" @click="reindex">
+                        {{ busyReindex ? 'Liest ein…' : 'Atlas-Ordner neu einlesen' }}
+                    </button>
                 </aside>
             </div>
         </div>
@@ -4803,92 +5727,192 @@ const AtlasTodayPage = {
     data() {
         return {
             data: null,
+            week: null,
+            chapters: [],
             loading: true,
             pending: null,
-            busyJournal: false,
-            busyReindex: false,
             busyCarry: false,
-            _es: null,
-            _timer: null,
+            busyReindex: false,
+            addingGoal: false,
+            goalDraft: '',
+            busyGoal: false,
         };
     },
     computed: {
         tasks() { return (this.data && this.data.tasks) || []; },
-        carryOver() { return (this.data && this.data.carry_over) || []; },
+        // Verschobene Zeilen (→) gehören zu ihrem neuen Tag, nicht zu heute.
+        todayAll() { return this.tasks.filter((t) => !t.moved_to); },
+        todayOpen() { return this.todayAll.filter((t) => !t.done); },
+        todayDone() { return this.todayAll.filter((t) => t.done); },
+        todayPct() {
+            const n = this.todayAll.length;
+            return (n ? Math.round(this.todayDone.length / n * 100) : 0) + '%';
+        },
+        carry() { return (this.data && this.data.carry_over) || []; },
         goals() { return (this.data && this.data.goals) || []; },
+        goalsReached() { return this.goals.filter((g) => this.goalReached(g)).length; },
         zettel() { return (this.data && this.data.zettel) || []; },
-        doneCount() { return this.tasks.filter((t) => t.done).length; },
-        weekNumber() {
-            const m = /W(\d{2})/.exec((this.data && this.data.week) || '');
-            return m ? Number(m[1]) : '';
+        weekTasks() { return (this.week && this.week.tasks) || []; },
+        weekDays() {
+            return ((this.week && this.week.days) || []).map((d) => {
+                const rows = (d.tasks || []).filter((t) => !t.moved_to);
+                const done = rows.filter((t) => t.done).length;
+                return { date: d.date, weekday: d.weekday, done, open: rows.length - done, total: rows.length };
+            });
+        },
+        weekDone() { return this.weekDays.reduce((n, d) => n + d.done, 0); },
+        weekTotal() { return this.weekDays.reduce((n, d) => n + d.total, 0); },
+        weekBars() {
+            const max = Math.max(1, ...this.weekDays.map((d) => d.total));
+            const H = 50;
+            const today = this.data && this.data.date;
+            return this.weekDays.map((d) => ({
+                date: d.date,
+                label: atlasShortDay(d.date),
+                today: d.date === today,
+                total: d.total,
+                done: d.done,
+                open: d.open,
+                title: atlasShortDay(d.date) + ' ' + this.dayNum(d.date) + '.' + (d.date === today ? ' (heute)' : '')
+                    + ': ' + d.done + ' von ' + d.total + ' erledigt',
+                doneH: Math.max(Math.round(d.done / max * H), 3) + 'px',
+                openH: Math.max(Math.round(d.open / max * H) - 2, 3) + 'px',
+            }));
+        },
+        diss() {
+            let done = 0;
+            let draft = 0;
+            for (const c of this.chapters) {
+                if (ATLAS_DISS_DONE.has(c.status)) done += 1;
+                else if (c.status === 'in-progress') draft += 1;
+            }
+            return { done, draft, open: this.chapters.length - done - draft };
+        },
+        dissBar() {
+            const d = this.diss;
+            return [].concat(Array(d.done).fill('done'), Array(d.draft).fill('draft'), Array(d.open).fill('open'));
+        },
+        due() { return (this.data && this.data.due) || {}; },
+        // Termine = Meilensteine der Projekte und Fristen der Veröffentlichungen.
+        termine() {
+            const out = [];
+            for (const m of this.due.milestones || []) {
+                out.push({
+                    key: 'ms:' + m.project_id + ':' + m.index,
+                    title: m.title,
+                    date: m.date,
+                    days: m.days,
+                    overdue: m.state === 'overdue',
+                    what: 'Meilenstein · ' + (m.project_title || m.project_id),
+                    open: { path: '/atlas/sammlung', query: { tab: 'projekte', proj: m.project_id } },
+                    // Überfälliges steht im Kalender unter „Liegen geblieben",
+                    // Kommendes in seiner Woche.
+                    to: m.state === 'overdue' ? '/atlas/woche' : '/atlas/woche/' + atlasWeekIdOf(atlasDate(m.date)),
+                });
+            }
+            for (const d of this.due.deadlines || []) {
+                out.push({
+                    key: 'pub:' + d.id,
+                    title: d.title,
+                    date: d.date,
+                    days: d.days,
+                    overdue: d.state === 'overdue',
+                    what: 'Frist · Veröffentlichung',
+                    open: atlasPublicationRoute(d.id),
+                    to: d.state === 'overdue' ? '/atlas/woche' : '/atlas/woche/' + atlasWeekIdOf(atlasDate(d.date)),
+                });
+            }
+            out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+            return out;
+        },
+        overdue() { return this.termine.filter((t) => t.overdue); },
+        soon() { return this.termine.filter((t) => !t.overdue); },
+        nextTermin() { return this.soon[0] || null; },
+        still() {
+            const out = [];
+            for (const f of this.due.follow_ups || []) {
+                const weeks = Math.floor(Math.abs(f.days) / 7);
+                out.push({
+                    key: 'fu:' + f.id,
+                    icon: 'clock',
+                    title: f.title + ' – nachfragen?',
+                    note: 'seit ' + weeks + ' Wochen eingereicht' + (f.venue ? ' bei ' + f.venue : '') + ' · beim Journal nachfragen',
+                    to: atlasPublicationRoute(f.id),
+                });
+            }
+            for (const c of this.due.stale_chapters || []) {
+                out.push({
+                    key: 'ch:' + c.id,
+                    icon: 'book',
+                    title: c.title || c.id,
+                    note: this.since(c.days) + ' unverändert',
+                    to: { path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } },
+                });
+            }
+            for (const i of this.due.stale_ideas || []) {
+                out.push({
+                    key: 'id:' + i.id,
+                    icon: 'bulb',
+                    title: 'Idee: ' + (i.title || i.id),
+                    note: this.since(i.days) + ' nicht weiterentwickelt',
+                    to: { path: '/atlas/sammlung', query: { tab: 'ideen', idea: i.id } },
+                });
+            }
+            return out;
+        },
+        kicker() {
+            if (!this.data) return 'Atlas · Übersicht';
+            return 'Atlas · KW ' + atlasWeekNumber(this.data.week) + ' · Tag ' + this.dayIndex + ' von 7';
         },
         dayIndex() {
             const d = atlasDate(this.data && this.data.date);
             return d ? ((d.getDay() + 6) % 7) + 1 : 0;
         },
         headline() {
-            if (!this.data) return 'Heute';
+            if (!this.data) return 'Übersicht';
             return this.data.weekday + ', ' + atlasDayMonth(this.data.date);
         },
-        // „Was liegt an" als eine Liste: Meilensteine zuerst (die haben ein
-        // Datum), dann stehengebliebene Kapitel und Seed-Ideen (Story 15–17).
-        dueItems() {
-            const due = (this.data && this.data.due) || {};
-            const out = [];
-            for (const m of due.milestones || []) {
-                const late = Math.abs(m.days);
-                out.push({
-                    key: 'ms:' + m.project_id + ':' + m.index,
-                    title: m.title,
-                    overdue: m.state === 'overdue',
-                    note: 'Projekt · ' + (m.project_title || m.project_id) + ' · '
-                        + (m.days < 0
-                            ? late + (late === 1 ? ' Tag überfällig' : ' Tage überfällig')
-                            : (m.days === 0 ? 'heute fällig' : 'fällig ' + atlasShortDate(m.date))),
-                    to: { path: '/atlas/sammlung', query: { tab: 'projekte', proj: m.project_id } },
-                });
-            }
-            for (const c of due.stale_chapters || []) {
-                out.push({
-                    key: 'ch:' + c.id,
-                    title: c.title || c.id,
-                    overdue: false,
-                    note: 'Kapitel · ' + this.since(c.days) + ' unverändert',
-                    to: { path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } },
-                });
-            }
-            for (const i of due.stale_ideas || []) {
-                out.push({
-                    key: 'id:' + i.id,
-                    title: i.title || i.id,
-                    overdue: false,
-                    note: 'Idee · ' + this.since(i.days) + ' im Status seed',
-                    to: { path: '/atlas/sammlung', query: { tab: 'ideen', idea: i.id } },
-                });
-            }
-            return out;
+        summary() {
+            if (!this.data) return '';
+            const n = this.todayOpen.length;
+            const parts = [n + (n === 1 ? ' Aufgabe offen' : ' Aufgaben offen')];
+            if (this.nextTermin) parts.push('nächster Termin ' + atlasInDays(this.nextTermin.days));
+            if (this.overdue.length) parts.push(this.overdue.length + ' überfällig');
+            return parts.join(' · ');
         },
     },
     methods: {
         taskKey(task) { return task.week + '#' + task.body_index; },
-        shortDate(iso) { return atlasShortDate(iso); },
-        // „seit 1 Tag" statt „seit 1 Tagen" — der Server zählt Tage in die
-        // Vergangenheit negativ, die Anzeige dreht das um.
+        shortDay(iso) { return atlasShortDay(iso); },
+        dayNum(iso) { const d = atlasDate(iso); return d ? d.getDate() : ''; },
+        inDays(n) { return atlasInDays(n); },
+        dayLabel(iso) {
+            return atlasShortDay(iso) + ', ' + atlasFormatDate(iso, { day: 'numeric', month: 'short' });
+        },
+        noteKind(type) { return ATLAS_ZETTEL_TYPES[type] || ATLAS_ZETTEL_TYPES.fleeting; },
+        // „heute", „gestern", sonst der Wochentag (diese Woche) oder das Datum.
+        when(iso) {
+            const today = this.data && this.data.date;
+            if (!iso || !today) return '';
+            if (iso === today) return 'heute';
+            if (iso === atlasAddDays(today, -1)) return 'gestern';
+            if (iso > atlasAddDays(today, -7) && iso < today) return atlasShortDay(iso);
+            return atlasShortDate(iso);
+        },
         since(days) {
             const n = Math.abs(Number(days) || 0);
-            if (n === 0) return 'seit heute';
+            if (n >= 60) return 'seit ' + Math.floor(n / 30) + ' Monaten';
+            if (n >= 14) return 'seit ' + Math.floor(n / 7) + ' Wochen';
             if (n === 1) return 'seit 1 Tag';
-            if (n >= 60) return 'seit über ' + Math.floor(n / 30) + ' Monaten';
             return 'seit ' + n + ' Tagen';
         },
         goalReached(goal) {
             return !!goal.done || (goal.total > 0 && goal.done_count === goal.total);
         },
-        goalCount(goal) {
-            if (goal.total) return goal.done_count + '/' + goal.total;
-            return goal.done ? 'erledigt' : 'offen';
+        goalPercent(goal) {
+            if (this.goalReached(goal)) return '100%';
+            return Math.round((goal.progress || 0) * 100) + '%';
         },
-        goalPercent(goal) { return Math.round((goal.progress || 0) * 100) + '%'; },
         taskUrl(task) {
             return '/api/plugins/atlas/journal/' + encodeURIComponent(task.week)
                 + '/tasks/' + encodeURIComponent(task.body_index);
@@ -4897,103 +5921,110 @@ const AtlasTodayPage = {
             if (!silent) this.loading = true;
             const data = await atlasRefreshToday();
             if (data) this.data = data;
+            const week = (data && data.week) || atlasWork.week;
+            const [weekData, diss] = await Promise.all([
+                week ? api('/api/plugins/atlas/journal/' + encodeURIComponent(week)).catch(() => null) : null,
+                api('/api/plugins/atlas/diss').catch(() => null),
+            ]);
+            if (weekData) this.week = weekData;
+            if (diss) this.chapters = diss.chapters || [];
             this.loading = false;
         },
-        // Nachladen nach einem Ereignis wird gebündelt: ein Schreibvorgang
-        // löst Watcher- UND Router-Ereignis aus, das soll ein Reload bleiben.
-        scheduleReload() {
-            if (this._timer) clearTimeout(this._timer);
-            this._timer = setTimeout(() => { this._timer = null; this.load(true); }, 200);
+        // Heute fasst fast alles zusammen; nur Dateien in Manuskript- und
+        // Dokumentordnern ändern hier nichts.
+        reloadFor(kinds) {
+            if (atlasTouches(kinds, ['journal', 'zettel', 'idea', 'diss_node', 'project', 'publication', 'collection'])) {
+                return this.load(true);
+            }
+            return null;
         },
         async toggle(task) {
-            // Optimistisch: das Häkchen sitzt sofort, ein Fehler nimmt es zurück.
-            // Bewusst OHNE `pending`: das Häkchen ist die Rückmeldung, ein
-            // Abblenden der Zeile für die Dauer des Schreibvorgangs wäre genau
-            // das Flackern, das ein Klick auf eine Checkbox nicht haben darf.
             const before = task.done;
             task.done = !before;
             task.open = !task.done && !task.moved_to;
             try {
                 await api(this.taskUrl(task) + '/toggle', { method: 'POST' });
-                await this.load(true);
             } catch (e) {
                 task.done = before;
                 task.open = !before && !task.moved_to;
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
+            await this.load(true);
         },
-        // Die Zeile ändert sich gleich wirklich (Text, Position, Verschwinden) —
-        // hier ist das Abblenden ehrliche Rückmeldung, kein Flackern.
-        async write(task, run) {
+        async carryOne(task) {
             this.pending = this.taskKey(task);
             try {
-                await run();
+                await api(this.taskUrl(task) + '/move', { method: 'POST', body: JSON.stringify({ to: this.data.date }) });
+                atlasToast('„' + task.text + '" liegt jetzt auf heute.');
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             this.pending = null;
             await this.load(true);
-        },
-        saveText(task, text) {
-            return this.write(task, () => api(this.taskUrl(task), {
-                method: 'PUT', body: JSON.stringify({ text }),
-            }));
-        },
-        remove(task) {
-            return this.write(task, () => api(this.taskUrl(task), { method: 'DELETE' }));
-        },
-        reorder(task, position) {
-            if (position < 0 || position >= this.tasks.length) return Promise.resolve();
-            return this.write(task, () => api(this.taskUrl(task) + '/reorder', {
-                method: 'POST', body: JSON.stringify({ position }),
-            }));
-        },
-        carryOne(task) {
-            return this.write(task, () => api(this.taskUrl(task) + '/move', {
-                method: 'POST', body: JSON.stringify({ to: this.data.date }),
-            }));
         },
         async carryAll() {
             if (this.busyCarry || !this.data) return;
             this.busyCarry = true;
             try {
-                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.data.week) + '/carry-over', {
-                    method: 'POST',
-                    body: JSON.stringify({ to: this.data.date }),
+                const res = await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.data.week) + '/carry-over', {
+                    method: 'POST', body: JSON.stringify({ to: this.data.date }),
                 });
+                const n = (res && res.moved) || 0;
+                atlasToast(n === 1 ? '1 Aufgabe auf heute geholt.' : n + ' Aufgaben auf heute geholt.');
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             this.busyCarry = false;
             await this.load(true);
         },
-        async openJournal() {
-            if (this.busyJournal || !this.data) return;
-            this.busyJournal = true;
-            try {
-                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.data.week) + '/open', { method: 'POST' });
-            } catch (e) {
-                alert(atlasErrorText(e));
-            }
-            this.busyJournal = false;
+        startGoal() {
+            this.addingGoal = true;
+            this.goalDraft = '';
+            this.$nextTick(() => { if (this.$refs.goalInput) this.$refs.goalInput.focus(); });
         },
+        // Ein Ziel: Titel, dazu optional ein `[[anker]]` und ein `#tag` aus
+        // derselben Zeile — dieselbe Schreibweise wie beim Erfassen.
+        async saveGoal() {
+            const raw = this.goalDraft.trim();
+            if (!raw || this.busyGoal || !this.data) return;
+            const anchor = (/\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/.exec(raw) || [])[1] || null;
+            const tag = (/(?:^|\s)#([\wäöüÄÖÜß-]+)/.exec(raw) || [])[1] || null;
+            const title = raw.replace(/\[\[[^\]]*\]\]/g, '').replace(/(?:^|\s)#[\wäöüÄÖÜß-]+/g, ' ').replace(/\s+/g, ' ').trim() || raw;
+            const goals = this.goals.map((g) => ({ title: g.title, anchor: g.anchor || null, tag: g.tag || null, done: !!g.done }));
+            goals.push({ title, anchor, tag, done: false });
+            this.busyGoal = true;
+            try {
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.data.week) + '/goals', {
+                    method: 'PUT', body: JSON.stringify({ goals }),
+                });
+                this.addingGoal = false;
+                atlasToast('Wochenziel hinzugefügt.');
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busyGoal = false;
+            await this.load(true);
+        },
+        onCaptured() { this.load(true); },
+        // Den Index aus den Markdown-Dateien neu aufbauen (P1) — nach Edits
+        // außerhalb, falls der Watcher etwas verpasst hat.
         async reindex() {
             if (this.busyReindex) return;
             this.busyReindex = true;
             try {
                 await api('/api/plugins/atlas/reindex', { method: 'POST' });
                 await atlasLoadEntities(true);
+                atlasToast('Atlas-Ordner neu eingelesen.');
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             this.busyReindex = false;
             await this.load(true);
         },
-        onCaptured() { this.load(true); },
     },
     created() {
-        // Alte Tiefenlinks (/atlas?idea=…) zeigten auf die Sammlung, die jetzt
-        // unter /atlas/sammlung liegt — sie sollen weiter dort landen.
+        // Alte Tiefenlinks (/atlas?idea=…) zeigten auf die Sammlung — sie sollen
+        // weiter dort landen.
         const q = this.$route.query || {};
         if (q.idea || q.pub || q.proj || q.chapter || q.tab) {
             this.$router.replace({ path: '/atlas/sammlung', query: q });
@@ -5002,187 +6033,866 @@ const AtlasTodayPage = {
     mounted() {
         this.load();
         atlasLoadEntities();
-        this._es = atlasConnectEvents(() => this.scheduleReload());
+        this._live = atlasLiveReload((kinds) => this.reloadFor(kinds));
     },
     beforeUnmount() {
-        if (this._es) { this._es.close(); this._es = null; }
-        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+        if (this._live) { this._live.close(); this._live = null; }
     },
 };
 
-// ── Woche (Story 20–30) ─────────────────────────────────────────────────────
-// Sieben Tagesspalten, die Wochenziele darüber, der abgeleitete Rückblick
-// darunter. Die Woche steht im Pfad (/atlas/woche/2026-W39), damit Blättern
-// und Lesezeichen dasselbe sind; ohne Parameter ist es die laufende Woche.
-const AtlasWeekPage = {
+// ── Veröffentlichungen als Pipeline (#225) ──────────────────────────────────
+// Fünf Spalten nach Status, je mit „wer ist dran". Karten zieht man per
+// Drag & Drop (oder Griff + Alt ← / →) in eine andere Spalte; „Status
+// wechseln" trägt Einreich- und Veröffentlichungsdatum selbst ein, die Antwort
+// nennt, was gesetzt wurde — „Rückgängig" setzt den alten Status und leert
+// genau diese Felder über das partielle Update. Abgelehnte/zurückgezogene
+// Veröffentlichungen und LaTeX-Manuskripte ohne Veröffentlichung stehen
+// eingeklappt darunter.
+// Bezeichnungen aus PUBLICATION_STATUSES / PUBLICATION_TYPES (oben) — keine
+// zweite Liste.
+const ATLAS_PUBLICATION_STATUS_LABEL = Object.fromEntries(PUBLICATION_STATUSES.map((s) => [s.key, s.label]));
+const ATLAS_PUBLICATION_TYPE_LABEL = Object.fromEntries(PUBLICATION_TYPES.map((t) => [t.key, t.label]));
+const ATLAS_PIPELINE = [
+    { key: 'planned', hint: 'Soll mal ein Paper werden', who: 'Noch offen', whoTone: 'neutral' },
+    { key: 'drafting', hint: 'Du arbeitest am Manuskript', who: 'Du bist dran', whoTone: 'accent' },
+    { key: 'submitted', hint: 'Liegt beim Journal', who: 'Warten', whoTone: 'neutral' },
+    { key: 'in-revision', hint: 'Gutachten liegen vor', who: 'Du bist dran', whoTone: 'accent' },
+    { key: 'published', hint: 'Steht in deiner Publikationsliste', who: 'Fertig', whoTone: 'ok' },
+].map((col) => ({ ...col, name: ATLAS_PUBLICATION_STATUS_LABEL[col.key] }));
+const ATLAS_PIPELINE_CLOSED = new Set(PUBLICATION_STATUSES.filter((s) => s.closed).map((s) => s.key));
+const ATLAS_SUBMITTED_NUDGE_DAYS = 56;   // dieselbe Schwelle wie agenda.SUBMITTED_NUDGE_DAYS
+
+function atlasTodayIso() {
+    return atlasWork.today || atlasIso(new Date());
+}
+
+function atlasDaysBetween(fromIso, toIso) {
+    const a = atlasDate(fromIso);
+    const b = atlasDate(toIso);
+    if (!a || !b) return null;
+    return Math.round((b - a) / (24 * 3600 * 1000));
+}
+
+// Der Hinweis nach einem Statuswechsel — ohne Versprechen, etwas in der
+// Bibliothek abzulegen (Atlas fügt dort nie selbst etwas hinzu).
+function atlasStatusToast(pub, target, set) {
+    const title = '„' + pub.title + '"';
+    if (target === 'planned') return title + ' ist wieder geplant.';
+    if (target === 'drafting') return title + ' ist jetzt in Arbeit.';
+    if (target === 'submitted') {
+        return (set || []).includes('submitted')
+            ? 'Eingereicht am ' + atlasFormatDate(atlasTodayIso(), { day: 'numeric', month: 'short' }) + ' eingetragen – Atlas erinnert dich in 8 Wochen ans Nachfragen.'
+            : title + ' liegt beim Journal.';
+    }
+    if (target === 'in-revision') return 'Status: Überarbeiten. Trag die Revisionsfrist ein, dann steht sie im Kalender.';
+    if (target === 'published') {
+        return pub.paper
+            ? 'Glückwunsch! ' + title + ' steht jetzt in deiner Publikationsliste.'
+            : 'Glückwunsch! Verknüpfe dein eigenes Paper per DOI, dann ist die Publikationsliste vollständig.';
+    }
+    return title + ': ' + (ATLAS_PUBLICATION_STATUS_LABEL[target] || target) + '.';
+}
+
+// „Status wechseln" mit Rückgängig — geteilt von der Pipeline und den
+// Schritten der Detailseite. `after` lädt die Seite neu.
+async function atlasChangeStatus(pub, target, after) {
+    const res = await api('/api/plugins/atlas/publications/' + encodeURIComponent(pub.id) + '/status', {
+        method: 'POST', body: JSON.stringify({ status: target }),
+    });
+    const undoBody = { status: res.previous_status };
+    for (const field of res.set || []) undoBody[field] = null;
+    // „Veröffentlicht" führt in die Publikationsliste (#228): ohne eigenes
+    // Paper gleich in „Eigenes Paper per DOI verknüpfen", vorgewählt.
+    let link = null;
+    if (target === 'published') {
+        link = pub.paper
+            ? { label: 'Publikationsliste', to: atlasPublicationListRoute() }
+            : { label: 'DOI eintragen', to: atlasPublicationListRoute(pub.id) };
+    }
+    atlasToast(atlasStatusToast(pub, target, res.set), {
+        link,
+        actionLabel: 'Rückgängig',
+        action: async () => {
+            try {
+                await api('/api/plugins/atlas/publications/' + encodeURIComponent(pub.id), {
+                    method: 'PUT', body: JSON.stringify(undoBody),
+                });
+                atlasToast('Rückgängig gemacht.');
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            if (after) await after();
+        },
+    });
+    if (after) await after();
+    return res;
+}
+
+// „Aus Sammlung planen" (#225, ADR-0025): alle Sammlungen; eine davon wird
+// zur Veröffentlichung, deren Literatur live die Sammlung ist. „Lösen"
+// friert die Literatur ein. Beides mit „Rückgängig".
+const AtlasPlanDialog = {
+    components: { 'atlas-icon': AtlasIcon },
+    emits: ['close', 'changed'],
+    template: `
+        <div class="atlas-modal-backdrop" @click.self="$emit('close')" @keydown.esc="$emit('close')">
+            <div class="atlas-modal atlas-plan" role="dialog" aria-modal="true" aria-labelledby="atlas-plan-h">
+                <div class="atlas-new-head">
+                    <div>
+                        <h2 id="atlas-plan-h" class="atlas-modal-title">Aus Sammlung planen</h2>
+                        <p class="atlas-modal-sub">Sammlungen sind erst einmal nur Ablageorte für Paper. Wähl aus, welche zur Veröffentlichung werden soll – ihre Paper sind dann deren Literaturliste und bleiben aktuell.</p>
+                    </div>
+                    <button type="button" class="atlas-icon-square" aria-label="Schließen" @click="$emit('close')"><atlas-icon name="close" /></button>
+                </div>
+                <label class="atlas-search-field is-boxed">
+                    <atlas-icon name="search" />
+                    <span class="atlas-sr">Sammlungen durchsuchen</span>
+                    <input ref="search" v-model="q" type="search" class="atlas-search-input" placeholder="Sammlungen durchsuchen …" />
+                </label>
+                <div class="atlas-plan-body">
+                    <p v-if="loading" class="atlas-muted">Lädt…</p>
+                    <p v-else-if="!available" class="atlas-muted">Diese LocalBib-Version kennt noch keine Sammlungen.</p>
+                    <template v-else>
+                        <section aria-labelledby="atlas-plan-free">
+                            <h3 id="atlas-plan-free" class="atlas-group-label is-flat">Sammlungen · {{ free.length }}</h3>
+                            <p v-if="!free.length" class="atlas-muted">{{ q ? 'Keine Sammlung passt zur Suche.' : 'Jede Sammlung ist schon eine Veröffentlichung.' }}</p>
+                            <ul class="atlas-plan-list">
+                                <li v-for="c in free" :key="c.id" class="atlas-plan-row">
+                                    <span class="atlas-plan-icon"><atlas-icon name="stack" /></span>
+                                    <div class="atlas-plan-text">
+                                        <div class="atlas-plan-name">{{ c.name }}</div>
+                                        <div class="atlas-plan-meta">{{ c.item_count }} Paper<template v-if="created(c)"> · {{ created(c) }}</template><template v-if="c.archived"> · archiviert</template></div>
+                                    </div>
+                                    <button type="button" class="atlas-btn is-outline-accent" :disabled="busy === c.id"
+                                            :aria-label="'„' + c.name + '“ als Veröffentlichung planen'" @click="plan(c)">Als Veröffentlichung planen</button>
+                                </li>
+                            </ul>
+                        </section>
+                        <section aria-labelledby="atlas-plan-pub">
+                            <h3 id="atlas-plan-pub" class="atlas-group-label is-flat">Schon Veröffentlichungen · {{ planned.length }}</h3>
+                            <ul class="atlas-plan-list">
+                                <li v-for="c in planned" :key="c.id" class="atlas-plan-row is-planned">
+                                    <span class="atlas-plan-icon is-accent"><atlas-icon name="doc" /></span>
+                                    <div class="atlas-plan-text">
+                                        <div class="atlas-plan-name">{{ c.name }}</div>
+                                        <div class="atlas-plan-meta">{{ c.item_count }} Paper · {{ c.entry.kind === 'project' ? 'als Forschungsprojekt' : 'als „' + c.entry.title + '“' }}</div>
+                                    </div>
+                                    <span class="atlas-who is-accent">{{ stage(c.entry) }}</span>
+                                    <router-link :to="openRoute(c.entry)" class="atlas-btn is-small" @click="$emit('close')">Öffnen</router-link>
+                                    <button type="button" class="atlas-text-btn is-muted" :disabled="busy === c.id"
+                                            :aria-label="'„' + c.name + '“ nicht mehr als Veröffentlichung führen'" @click="unplan(c)">Lösen</button>
+                                </li>
+                            </ul>
+                        </section>
+                    </template>
+                </div>
+                <div class="atlas-new-foot">
+                    <span class="atlas-muted">Neue Sammlungen aus LocalBib landen hier – ohne Rückfrage. Du planst nur, was du willst.</span>
+                    <button type="button" class="atlas-btn is-primary is-tall" @click="$emit('close')">Fertig</button>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return { rows: [], available: true, loading: true, q: '', busy: null };
+    },
+    computed: {
+        matching() {
+            const q = this.q.trim().toLowerCase();
+            return q ? this.rows.filter((c) => (c.name || '').toLowerCase().includes(q)) : this.rows;
+        },
+        free() { return this.matching.filter((c) => !c.entry); },
+        planned() { return this.matching.filter((c) => c.entry); },
+    },
+    methods: {
+        created(c) {
+            if (!c.created_at) return '';
+            const days = atlasDaysBetween(String(c.created_at).slice(0, 10), atlasTodayIso());
+            if (days === null) return '';
+            if (days <= 0) return 'angelegt heute';
+            if (days === 1) return 'angelegt gestern';
+            if (days < 14) return 'angelegt vor ' + days + ' Tagen';
+            if (days < 60) return 'angelegt vor ' + Math.round(days / 7) + ' Wochen';
+            return 'angelegt im ' + atlasFormatDate(String(c.created_at).slice(0, 10), { month: 'long', year: 'numeric' });
+        },
+        stage(entry) {
+            if (entry.kind === 'project') return 'Projekt';
+            return ATLAS_PUBLICATION_STATUS_LABEL[entry.status] || 'Geplant';
+        },
+        openRoute(entry) {
+            return entry.kind === 'project'
+                ? { path: '/atlas/sammlung', query: { tab: 'projekte', proj: entry.id } }
+                : atlasPublicationRoute(entry.id);
+        },
+        async load() {
+            try {
+                const data = await api('/api/plugins/atlas/collections');
+                this.rows = data.collections || [];
+                this.available = data.available !== false;
+            } catch (e) {
+                this.rows = [];
+            }
+            this.loading = false;
+        },
+        async refresh() {
+            await this.load();
+            this.$emit('changed');
+        },
+        // `released` ({id, kind}) ist die Antwort von „Lösen": Rückgängig
+        // verknüpft genau diese Datei wieder — eine Veröffentlichung oder ein
+        // Forschungsprojekt.
+        async plan(c, released) {
+            this.busy = c.id;
+            try {
+                let body = {};
+                if (released) {
+                    body = released.kind === 'project' ? { project_id: released.id } : { publication_id: released.id };
+                }
+                const res = await api('/api/plugins/atlas/collections/' + c.id + '/plan', {
+                    method: 'POST', body: JSON.stringify(body),
+                });
+                const entryId = res.entry.id;
+                if (released) {
+                    atlasToast(released.kind === 'project'
+                        ? '„' + c.name + '“ ist wieder die Literatur des Forschungsprojekts.'
+                        : '„' + c.name + '“ ist wieder die Literatur der Veröffentlichung.');
+                } else {
+                    atlasToast('„' + c.name + '“ steht jetzt unter „Geplant“ – die ' + c.item_count + ' Paper sind die Literaturliste.', {
+                        actionLabel: 'Rückgängig',
+                        // Ein Fehlklick soll folgenlos bleiben: die eben angelegte
+                        // Datei geht wieder (ADR-0025).
+                        action: async () => {
+                            try {
+                                await api('/api/plugins/atlas/publications/' + encodeURIComponent(entryId), { method: 'DELETE' });
+                            } catch (e) {
+                                atlasToast(atlasErrorText(e), { tone: 'danger' });
+                            }
+                            await this.refresh();
+                        },
+                    });
+                }
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busy = null;
+            await this.refresh();
+        },
+        async unplan(c) {
+            this.busy = c.id;
+            const entry = c.entry;
+            try {
+                const res = await api('/api/plugins/atlas/collections/' + c.id + '/unplan', { method: 'POST' });
+                const n = (res.refs || []).length;
+                atlasToast('„' + entry.title + '“ bleibt bestehen und behält die ' + n + ' Paper als feste Liste. Die Sammlung ist wieder nur ein Ablageort.', {
+                    actionLabel: 'Rückgängig',
+                    action: () => this.plan(c, { id: res.id, kind: res.kind }),
+                });
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busy = null;
+            await this.refresh();
+        },
+    },
+    mounted() {
+        this.load();
+        this.$nextTick(() => { if (this.$refs.search) this.$refs.search.focus(); });
+    },
+};
+
+const AtlasPipelinePage = {
     components: {
         'atlas-nav': AtlasNav,
-        'atlas-capture': AtlasCapture,
-        'atlas-anchor-chip': AtlasAnchorChip,
+        'atlas-header': AtlasHeader,
+        'atlas-icon': AtlasIcon,
+        'atlas-plan-dialog': AtlasPlanDialog,
     },
     template: `
-        <div class="p-6 atlas-page">
-            <atlas-nav :active="navKey" />
+        <div class="atlas-page atlas-shell" lang="de">
+            <atlas-header kicker="Atlas · Schreiben" title="Veröffentlichungen" :subtitle="summary"
+                          new-label="Neues Vorhaben" new-type="pub">
+                <router-link :to="listRoute" class="atlas-btn is-tall">
+                    <atlas-icon name="list" /> Publikationsliste
+                </router-link>
+                <button type="button" class="atlas-btn is-tall" @click="planOpen = true">
+                    <atlas-icon name="stack" /> Aus Sammlung planen
+                </button>
+            </atlas-header>
+            <atlas-nav active="veroeffentlichungen">
+                <span class="atlas-hint-line">
+                    <span class="atlas-hint-grip"><atlas-icon name="grip" :size="16" /></span>
+                    Karte in die nächste Spalte ziehen – Datum und Erinnerung trägt Atlas selbst ein. Titel anklicken öffnet die Details.
+                </span>
+            </atlas-nav>
 
-            <div class="atlas-head">
-                <div>
-                    <div class="atlas-kicker">{{ range || 'Kalenderwoche' }}</div>
-                    <h1 class="atlas-title">Kalenderwoche {{ week ? week.number : '' }}</h1>
-                </div>
-                <div class="atlas-actions">
-                    <router-link v-if="week" :to="'/atlas/woche/' + week.previous" class="atlas-pill">← KW {{ weekNumberOf(week.previous) }}</router-link>
-                    <router-link v-if="week" :to="'/atlas/woche/' + week.next" class="atlas-pill">KW {{ weekNumberOf(week.next) }} →</router-link>
-                    <span class="atlas-sep"></span>
-                    <button type="button" class="atlas-pill is-strong" :disabled="!week || goals.length >= 5 || editingGoal !== null"
-                            :title="goals.length >= 5 ? 'Höchstens fünf Wochenziele' : ''" @click="addGoal">
-                        Ziel hinzufügen
-                    </button>
+            <div class="atlas-board-scroll">
+                <div class="atlas-board">
+                    <section v-for="col in columns" :key="col.key" class="atlas-col"
+                             :class="{ 'is-over': overCol === col.key && canDropOn(col.key), 'is-published': col.key === 'published' }"
+                             :aria-label="col.name + ', ' + col.items.length + ' Einträge'"
+                             @dragover="onDragOver($event, col.key)" @dragleave="onDragLeave($event, col.key)"
+                             @drop="onDrop($event, col.key)">
+                        <header class="atlas-col-head">
+                            <div class="atlas-col-title-row">
+                                <h2 class="atlas-col-title">{{ col.name }}</h2>
+                                <span class="atlas-mono-sub">{{ col.items.length }}</span>
+                            </div>
+                            <div class="atlas-col-sub">
+                                <span class="atlas-who" :class="'is-' + col.whoTone">{{ col.who }}</span>
+                                <span class="atlas-col-hint">{{ col.hint }}</span>
+                            </div>
+                        </header>
+                        <ul class="atlas-cards">
+                            <li v-for="p in col.items" :key="p.id" class="atlas-card-li" :class="{ 'is-dragging': dragging === p.id }"
+                                draggable="true" :data-pub="p.id"
+                                @dragstart="onDragStart($event, p)" @dragend="onDragEnd">
+                                <article class="atlas-pcard">
+                                    <button type="button" class="atlas-grip" :data-grip="p.id"
+                                            :aria-label="'Verschieben: ' + p.title" title="Ziehen oder Alt + Pfeiltaste"
+                                            @keydown="onGripKey($event, p)"><atlas-icon name="grip" :size="16" /></button>
+                                    <div class="atlas-pcard-body">
+                                        <span v-if="p.timer" class="atlas-timer" :class="'is-' + p.timer.tone">
+                                            <atlas-icon :name="p.timer.icon" :size="14" />{{ p.timer.text }}
+                                        </span>
+                                        <h3 class="atlas-pcard-title">
+                                            <router-link :to="detailRoute(p.id)" draggable="false">{{ p.title }}</router-link>
+                                        </h3>
+                                        <div class="atlas-pcard-meta">
+                                            <span class="atlas-pcard-venue">{{ p.venueLine }}</span>
+                                            <span v-if="p.coauthors" class="atlas-pcard-co">{{ p.coauthors }}</span>
+                                        </div>
+                                        <div v-if="p.progress" class="atlas-pcard-progress">
+                                            <div class="atlas-meter is-thin"><div class="atlas-meter-fill" :style="{ width: p.progress.pct }"></div></div>
+                                            <span class="atlas-pcard-progress-text">{{ p.progress.text }}</span>
+                                        </div>
+                                        <div v-if="p.links.length" class="atlas-pcard-links">
+                                            <span v-for="l in p.links" :key="l.kind + l.label" class="atlas-chip is-static">
+                                                <span class="atlas-chip-kind">{{ l.kind }}</span><span class="atlas-chip-label">{{ l.label }}</span>
+                                            </span>
+                                        </div>
+                                    </div>
+                                </article>
+                            </li>
+                        </ul>
+                        <div v-if="overCol === col.key && canDropOn(col.key)" class="atlas-dropzone">Nach „{{ col.name }}“ verschieben</div>
+                        <p v-if="!col.items.length && !(overCol === col.key && canDropOn(col.key))" class="atlas-col-empty">Gerade nichts hier.</p>
+                        <div v-if="col.key === 'planned'" class="atlas-col-foot">
+                            <button type="button" class="atlas-col-foot-btn" @click="newPub"><atlas-icon name="plus" :size="16" /> Neues Vorhaben</button>
+                            <button type="button" class="atlas-col-foot-btn" @click="planOpen = true"><atlas-icon name="stack" :size="16" /> Aus Sammlung planen</button>
+                        </div>
+                        <div v-if="col.key === 'published'" class="atlas-col-foot">
+                            <router-link :to="listRoute" class="atlas-col-foot-btn is-link">
+                                Ganze Publikationsliste <atlas-icon name="arrow" :size="15" />
+                            </router-link>
+                        </div>
+                    </section>
                 </div>
             </div>
 
-            <atlas-capture @created="onCaptured" />
+            <div class="atlas-folds">
+                <button type="button" class="atlas-fold-btn" :aria-expanded="showClosed ? 'true' : 'false'"
+                        :disabled="!closed.length" @click="showClosed = !showClosed">
+                    <atlas-icon :name="showClosed ? 'chevronLeft' : 'chevronRight'" :size="16" />
+                    Abgelehnt oder zurückgezogen · {{ closed.length }}
+                </button>
+                <button type="button" class="atlas-fold-btn" :aria-expanded="showOrphans ? 'true' : 'false'"
+                        :disabled="!orphans.length" @click="showOrphans = !showOrphans">
+                    <atlas-icon :name="showOrphans ? 'chevronLeft' : 'chevronRight'" :size="16" />
+                    LaTeX-Manuskript ohne Veröffentlichung · {{ orphans.length }}
+                </button>
+            </div>
+            <ul v-if="showClosed && closed.length" class="atlas-fold-list" aria-label="Abgelehnt oder zurückgezogen">
+                <li v-for="p in closed" :key="p.id" class="atlas-fold-row">
+                    <span class="atlas-badge">{{ statusLabel(p.status) }}</span>
+                    <router-link :to="detailRoute(p.id)" class="atlas-notes-title">{{ p.title }}</router-link>
+                    <span class="atlas-muted">{{ p.venue || '' }}</span>
+                </li>
+            </ul>
+            <ul v-if="showOrphans && orphans.length" class="atlas-fold-list" aria-label="LaTeX-Manuskripte ohne Veröffentlichung">
+                <li v-for="m in orphans" :key="m.id" class="atlas-fold-row">
+                    <span class="atlas-badge">LaTeX</span>
+                    <router-link :to="editorRoute(m.id)" class="atlas-notes-title">{{ m.id }}.tex</router-link>
+                </li>
+            </ul>
 
-            <datalist :id="entityListId">
-                <option v-for="e in entities" :key="e.id" :value="e.id">{{ e.title }}</option>
-            </datalist>
+            <atlas-plan-dialog v-if="planOpen" @close="closePlan" @changed="load(true)" />
+        </div>
+    `,
+    data() {
+        return {
+            pubs: [],
+            chapters: [],
+            orphans: [],
+            loading: true,
+            dragging: null,
+            overCol: null,
+            showClosed: false,
+            showOrphans: false,
+            planOpen: false,
+            busy: false,
+        };
+    },
+    computed: {
+        chapterOf() {
+            const map = {};
+            for (const c of this.chapters) {
+                for (const pid of c.publications || []) if (!map[pid]) map[pid] = c;
+            }
+            return map;
+        },
+        columns() {
+            return ATLAS_PIPELINE.map((st) => ({
+                ...st,
+                items: this.pubs.filter((p) => (p.status || 'planned') === st.key).map((p) => this.card(p)),
+            }));
+        },
+        closed() { return this.pubs.filter((p) => ATLAS_PIPELINE_CLOSED.has(p.status)); },
+        summary() {
+            const mine = this.pubs.filter((p) => p.status === 'drafting' || p.status === 'in-revision').length;
+            const waiting = this.pubs.filter((p) => p.status === 'submitted').length;
+            const pub = this.pubs.filter((p) => p.status === 'published').length;
+            return mine + ' warten auf dich · ' + waiting + ' beim Journal · ' + pub + ' veröffentlicht';
+        },
+        dragPub() { return this.pubs.find((p) => p.id === this.dragging) || null; },
+        listRoute() { return atlasPublicationListRoute(); },
+    },
+    methods: {
+        detailRoute(id) { return atlasPublicationRoute(id); },
+        editorRoute(id) { return atlasEditorRoute(id); },
+        statusLabel(s) { return ATLAS_PUBLICATION_STATUS_LABEL[s] || s; },
+        newPub() { atlasOpenNew('pub'); },
+        closePlan() {
+            this.planOpen = false;
+            if (this.$route.query.planen) this.$router.replace(ATLAS_PUBLICATIONS_ROUTE);
+        },
+        // Badge je Spalte: Frist oder Wartezeit (Design „Veroeffentlichungen").
+        timer(p) {
+            const today = atlasTodayIso();
+            const dueIn = p.due ? atlasDaysBetween(today, p.due) : null;
+            const dueText = (label) => {
+                if (dueIn === null) return null;
+                if (dueIn < 0) return { text: label + ' überfällig seit ' + (-dueIn) + (dueIn === -1 ? ' Tag' : ' Tagen'), tone: 'danger', icon: 'alert' };
+                if (dueIn === 0) return { text: label + ' heute', tone: 'soon', icon: 'flag' };
+                return { text: label + ' in ' + dueIn + (dueIn === 1 ? ' Tag' : ' Tagen'), tone: 'soon', icon: 'flag' };
+            };
+            if (p.status === 'planned' || p.status === 'drafting') return dueText('Frist');
+            if (p.status === 'submitted') {
+                const ago = p.submitted ? atlasDaysBetween(p.submitted, today) : null;
+                if (ago === null) return { text: 'beim Journal', tone: 'wait', icon: 'clock' };
+                if (ago <= 0) return { text: 'heute eingereicht', tone: 'wait', icon: 'clock' };
+                if (ago > ATLAS_SUBMITTED_NUDGE_DAYS) return { text: 'seit ' + ago + ' Tagen beim Journal – nachfragen?', tone: 'warn', icon: 'alert' };
+                return { text: 'seit ' + ago + (ago === 1 ? ' Tag' : ' Tagen') + ' beim Journal', tone: 'wait', icon: 'clock' };
+            }
+            if (p.status === 'in-revision') {
+                return dueText('Revision fällig') || { text: 'Revisionsfrist eintragen', tone: 'warn', icon: 'alert' };
+            }
+            if (p.status === 'published') {
+                if (!p.paper) return { text: 'DOI fehlt noch', tone: 'warn', icon: 'alert' };
+                const year = (p.published || '').slice(0, 4);
+                return { text: year ? 'Veröffentlicht ' + year : 'Veröffentlicht', tone: 'ok', icon: 'check' };
+            }
+            return null;
+        },
+        card(p) {
+            const typeLabel = ATLAS_PUBLICATION_TYPE_LABEL[p.type] || '';
+            const links = [];
+            if (p.collection) {
+                links.push({ kind: 'Sammlung', label: (p.collection.name || p.title) + ' · ' + (p.collection.item_count || 0) });
+            }
+            for (const m of p.manuscripts || []) links.push({ kind: 'LaTeX', label: /\.tex$/i.test(m) ? m : m + '.tex' });
+            const ch = this.chapterOf[p.id];
+            if (ch) links.push({ kind: 'Kapitel', label: ch.title || ch.id });
+            if (p.status === 'planned') {
+                for (const iid of p.derived_from || []) {
+                    const e = atlasEntity(iid);
+                    links.push({ kind: 'Idee', label: (e && e.title) || iid });
+                }
+            }
+            if (p.status === 'published' && p.paper) links.push({ kind: 'Bibliothek', label: p.paper });
+            const check = p.checklist || {};
+            const progress = p.status === 'in-revision' && check.total
+                ? { pct: Math.round(check.done / check.total * 100) + '%', text: check.done + ' von ' + check.total + ' Gutachter-Punkten erledigt' }
+                : null;
+            return {
+                id: p.id,
+                title: p.title,
+                status: p.status,
+                venueLine: [p.venue || 'Ziel noch offen', typeLabel].filter(Boolean).join(' · '),
+                coauthors: (p.authors || []).length ? 'mit ' + p.authors.join(', ') : '',
+                timer: this.timer(p),
+                progress,
+                links,
+            };
+        },
+        async load(silent = false) {
+            if (!silent) this.loading = true;
+            const [pubs, diss, orphans] = await Promise.all([
+                api('/api/plugins/atlas/publications').catch(() => null),
+                api('/api/plugins/atlas/diss').catch(() => null),
+                api('/api/plugins/atlas/manuscripts/unassigned').catch(() => null),
+            ]);
+            if (pubs) this.pubs = pubs.publications || [];
+            if (diss) this.chapters = diss.chapters || [];
+            if (orphans) this.orphans = orphans.manuscripts || [];
+            this.loading = false;
+        },
+        // Karten: Veröffentlichungen (samt Sammlung), Kapitel, Manuskripte.
+        reloadFor(kinds) {
+            if (atlasTouches(kinds, ['publication', 'collection', 'diss_node', 'manuscript'])) return this.load(true);
+            return null;
+        },
+        canDropOn(key) {
+            return !!this.dragPub && this.dragPub.status !== key;
+        },
+        onDragStart(e, p) {
+            try {
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', p.id);
+            } catch (err) { /* Browser ohne DataTransfer */ }
+            this.dragging = p.id;
+        },
+        onDragEnd() {
+            this.dragging = null;
+            this.overCol = null;
+        },
+        onDragOver(e, key) {
+            if (!this.dragging) return;
+            e.preventDefault();
+            try { e.dataTransfer.dropEffect = 'move'; } catch (err) { /* ignore */ }
+            this.overCol = key;
+        },
+        onDragLeave(e, key) {
+            const to = e.relatedTarget;
+            if (to && e.currentTarget && e.currentTarget.contains(to)) return;
+            if (this.overCol === key) this.overCol = null;
+        },
+        async onDrop(e, key) {
+            e.preventDefault();
+            // Eine Karte ist keine Datei: der Datei-Drop des Kerns (Import)
+            // soll davon nichts sehen.
+            e.stopPropagation();
+            let id = this.dragging;
+            if (!id) {
+                try { id = e.dataTransfer.getData('text/plain'); } catch (err) { id = null; }
+            }
+            this.dragging = null;
+            this.overCol = null;
+            if (id) await this.moveTo(id, key);
+        },
+        onGripKey(e, p) {
+            if (!e.altKey || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+            e.preventDefault();
+            const order = ATLAS_PIPELINE.map((s) => s.key);
+            const idx = order.indexOf(p.status) + (e.key === 'ArrowRight' ? 1 : -1);
+            if (idx < 0 || idx >= order.length) return;
+            this.moveTo(p.id, order[idx], true);
+        },
+        async moveTo(id, key, keepFocus = false) {
+            const pub = this.pubs.find((p) => p.id === id);
+            if (!pub || pub.status === key || this.busy) return;
+            this.busy = true;
+            const before = pub.status;
+            pub.status = key;   // optimistisch: die Karte steht sofort in der Zielspalte
+            try {
+                await atlasChangeStatus(pub, key, () => this.load(true));
+            } catch (e) {
+                pub.status = before;
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busy = false;
+            if (keepFocus) {
+                this.$nextTick(() => {
+                    const grip = this.$el.querySelector('[data-grip="' + id + '"]');
+                    if (grip) grip.focus();
+                });
+            }
+        },
+    },
+    watch: {
+        '$route.query.planen'(v) { if (v) this.planOpen = true; },
+    },
+    mounted() {
+        if (this.$route.query.planen) this.planOpen = true;
+        this.load();
+        atlasLoadEntities();
+        if (!atlasWork.today) atlasRefreshToday();
+        this._live = atlasLiveReload((kinds) => this.reloadFor(kinds));
+    },
+    beforeUnmount() {
+        if (this._live) { this._live.close(); this._live = null; }
+    },
+};
 
-            <section aria-label="Wochenziele" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                <div v-if="loading" class="atlas-skel" style="height:86px"></div>
-                <p v-else-if="!goals.length && editingGoal === null" class="atlas-card atlas-empty md:col-span-2 xl:col-span-3">
-                    Diese Woche hat noch kein Ziel.
-                    <button type="button" class="atlas-link-btn" @click="addGoal">Ziel hinzufügen</button>
-                    <template v-if="week && week.previous">
-                        oder <button type="button" class="atlas-link-btn" :disabled="savingGoals" @click="adoptGoals">Ziele der Vorwoche übernehmen</button>.
-                    </template>
-                </p>
-                <template v-else>
-                    <div v-for="goal in goals" :key="goal.index" class="atlas-goal">
-                        <template v-if="editingGoal === goal.index">
-                            <div>
-                                <label class="atlas-field-label" :for="entityListId + '-title'">Titel</label>
-                                <input :id="entityListId + '-title'" class="atlas-field" v-model="goalDraft.title"
-                                       @keydown.enter.prevent="saveGoal" @keydown.esc.prevent="cancelGoal" />
-                            </div>
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label class="atlas-field-label">Anker</label>
-                                    <input class="atlas-field" :list="entityListId" v-model="goalDraft.anchor" placeholder="kapitel-03" />
-                                </div>
-                                <div>
-                                    <label class="atlas-field-label">Tag</label>
-                                    <input class="atlas-field" v-model="goalDraft.tag" placeholder="methodik" />
-                                </div>
-                            </div>
-                            <div class="flex items-center gap-2">
-                                <button type="button" class="atlas-pill is-strong" :disabled="savingGoals || !goalDraft.title.trim()" @click="saveGoal">Speichern</button>
-                                <button type="button" class="atlas-pill" @click="cancelGoal">Abbrechen</button>
-                                <button type="button" class="atlas-link-btn ml-auto" :disabled="savingGoals" @click="deleteGoal(goal.index)">Löschen</button>
-                            </div>
+// Der LaTeX-Editor lebt in der Sammlung (Tab „editor"); diese Adresse öffnet
+// ihn mit einem Manuskript.
+function atlasEditorRoute(id) {
+    return { path: '/atlas/sammlung', query: { tab: 'editor', manuscript: id } };
+}
+
+// ── Kalender (#224) ─────────────────────────────────────────────────────────
+// Die Woche als sieben Tagesspalten plus „Nächste Woche". Aufgaben und
+// Termine (Meilensteine der Projekte, Fristen der Veröffentlichungen) zieht
+// man per Drag & Drop auf einen anderen Tag — oder per Griff + Alt ← / →.
+// Nach jedem Verschieben ein Hinweis mit „Rückgängig": für Aufgaben über
+// „Übertrag zurücknehmen" (eine Zeilenoperation, ADR-0020), für Termine wird
+// das alte Datum zurückgeschrieben. Der Rückblick ist ein Umschalter; die
+// Rückblick-Route öffnet den Kalender in diesem Modus. Die Woche steht im Pfad
+// (/atlas/woche/2026-W39), damit Blättern und Lesezeichen dasselbe sind.
+const ATLAS_WEEKDAYS_LONG = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+const ATLAS_NEXT = 'next';
+
+function atlasDayLabel(iso) {
+    const d = atlasDate(iso);
+    return d ? atlasShortDay(iso) + ' ' + d.getDate() + '.' : String(iso || '');
+}
+
+function atlasDayLong(iso) {
+    const d = atlasDate(iso);
+    return d ? ATLAS_WEEKDAYS_LONG[(d.getDay() + 6) % 7] + ', ' + atlasFormatDate(iso, { day: 'numeric', month: 'short' }) : '';
+}
+
+const AtlasCalendarPage = {
+    components: {
+        'atlas-nav': AtlasNav,
+        'atlas-header': AtlasHeader,
+        'atlas-icon': AtlasIcon,
+    },
+    template: `
+        <div class="atlas-page atlas-shell" lang="de">
+            <atlas-header :kicker="'Atlas · Kalender · KW ' + (week ? week.number : '')" :title="rangeTitle">
+                <div class="atlas-weekswitch" role="group" aria-label="Woche wechseln">
+                    <router-link v-if="week" :to="routeFor(week.previous)" class="atlas-weekswitch-btn"
+                                 :aria-label="'Vorige Woche, KW ' + weekNumberOf(week.previous)"><atlas-icon name="chevronLeft" /></router-link>
+                    <router-link :to="routeFor('')" class="atlas-weekswitch-btn is-text">Diese Woche</router-link>
+                    <router-link v-if="week" :to="routeFor(week.next)" class="atlas-weekswitch-btn"
+                                 :aria-label="'Nächste Woche, KW ' + weekNumberOf(week.next)"><atlas-icon name="chevronRight" /></router-link>
+                </div>
+                <nav class="atlas-seg" aria-label="Ansicht">
+                    <router-link :to="weekRoute" class="atlas-seg-item" :class="{ 'is-active': !isReview }" :aria-current="!isReview ? 'page' : null">Woche</router-link>
+                    <router-link :to="reviewRoute" class="atlas-seg-item" :class="{ 'is-active': isReview }" :aria-current="isReview ? 'page' : null">Rückblick</router-link>
+                </nav>
+            </atlas-header>
+            <atlas-nav :active="isReview ? 'rueckblick' : 'woche'" />
+
+            <template v-if="!isReview">
+                <div class="atlas-cal-hint">
+                    <span class="atlas-hint-line">
+                        <span class="atlas-hint-grip"><atlas-icon name="grip" :size="16" /></span>
+                        Aufgaben und Termine einfach auf einen anderen Tag ziehen.
+                    </span>
+                    <span class="atlas-muted">Tastatur: Griff mit Tab wählen, dann Alt + ← / →</span>
+                    <span class="atlas-cal-legend">
+                        <span><i class="atlas-legend-box"></i>Aufgabe</span>
+                        <span><atlas-icon name="flag" :size="14" />Termin / Meilenstein</span>
+                        <button type="button" class="atlas-text-btn" :disabled="!week" @click="openWeekFile">Wochendatei öffnen</button>
+                    </span>
+                </div>
+
+                <section aria-label="Wochenziele" class="atlas-cal-goals">
+                    <span class="atlas-group-label is-flat is-inline">Wochenziele</span>
+                    <span v-if="!goals.length" class="atlas-muted">Noch keine Ziele für diese Woche.</span>
+                    <div v-for="g in goals" :key="g.index" class="atlas-cal-goal">
+                        <span class="atlas-cal-goal-title">{{ g.title }}</span>
+                        <template v-if="goalReached(g)">
+                            <span class="atlas-reached"><atlas-icon name="check" :size="14" /> erreicht</span>
                         </template>
                         <template v-else>
-                            <div class="atlas-goal-head">
-                                <label class="flex items-start gap-2 cursor-pointer">
-                                    <input type="checkbox" class="atlas-check" style="margin-top:2px" :checked="goal.done"
-                                           :aria-label="'Wochenziel erreicht: ' + goal.title" @change="toggleGoal(goal.index)" />
-                                    <span class="atlas-goal-title">{{ goal.title }}</span>
-                                </label>
-                                <span class="atlas-goal-count" :class="{ 'is-done': goalReached(goal) }">{{ goalCount(goal) }}</span>
-                            </div>
-                            <div class="atlas-bar">
-                                <div class="atlas-bar-fill" :class="{ 'is-done': goalReached(goal) }" :style="{ width: goalPercent(goal) }"></div>
-                            </div>
-                            <div class="flex items-baseline justify-between gap-2">
-                                <span class="atlas-goal-meta" :class="{ 'is-warn': !!deadline(goal) }">{{ goalMeta(goal) }}</span>
-                                <button type="button" class="atlas-link-btn" @click="editGoal(goal)">bearbeiten</button>
-                            </div>
+                            <span class="atlas-meter is-mini"><span class="atlas-meter-fill" :style="{ width: goalPercent(g) }"></span></span>
+                            <span v-if="g.total" class="atlas-mono-sub is-ink">{{ g.done_count }}/{{ g.total }}</span>
                         </template>
                     </div>
-                    <div v-if="editingGoal === -1" class="atlas-goal">
-                        <div>
-                            <label class="atlas-field-label" :for="entityListId + '-new'">Neues Wochenziel</label>
-                            <input :id="entityListId + '-new'" ref="newGoal" class="atlas-field" v-model="goalDraft.title"
-                                   placeholder="Kapitel 3 an die Betreuerin schicken"
-                                   @keydown.enter.prevent="saveGoal" @keydown.esc.prevent="cancelGoal" />
-                        </div>
-                        <div class="grid grid-cols-2 gap-2">
-                            <div>
-                                <label class="atlas-field-label">Anker</label>
-                                <input class="atlas-field" :list="entityListId" v-model="goalDraft.anchor" placeholder="kapitel-03" />
-                            </div>
-                            <div>
-                                <label class="atlas-field-label">Tag</label>
-                                <input class="atlas-field" v-model="goalDraft.tag" placeholder="methodik" />
-                            </div>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <button type="button" class="atlas-pill is-strong" :disabled="savingGoals || !goalDraft.title.trim()" @click="saveGoal">Anlegen</button>
-                            <button type="button" class="atlas-pill" @click="cancelGoal">Abbrechen</button>
-                        </div>
-                    </div>
-                </template>
-            </section>
-
-            <section aria-label="Tage" class="atlas-week">
-                <template v-if="loading">
-                    <div v-for="n in 7" :key="n" class="atlas-skel" style="height:150px"></div>
-                </template>
-                <template v-else>
-                <div v-for="day in days" :key="day.date" class="atlas-day"
-                     :class="{ 'is-today': day.date === todayIso, 'is-empty': !day.total && day.date !== todayIso }">
-                    <div class="atlas-day-head">
-                        <span class="atlas-day-name">
-                            {{ shortDay(day.date) }} {{ dayNumber(day.date) }}.<template v-if="day.date === todayIso"> · heute</template>
-                        </span>
-                        <span v-if="day.total" class="atlas-day-count" :class="{ 'is-open': day.open > 0 }">{{ day.done }}/{{ day.total }}</span>
-                    </div>
-                    <div v-if="day.tasks.length" class="atlas-day-tasks">
-                        <div v-for="task in day.tasks" :key="task.body_index" class="atlas-day-task" :class="{ 'is-done': task.done }">
-                            <input type="checkbox" class="atlas-check" :id="rowId(task)" :checked="task.done"
-                                   :disabled="!!task.moved_to" @change="toggle(task)" />
-                            <label :for="rowId(task)" class="atlas-day-label">
-                                {{ task.text || '(leere Zeile)' }}
-                                <span v-if="task.moved_to" style="color:var(--lb-accent)">→ {{ shortDay(task.moved_to) }}</span>
-                                <span v-else-if="task.moved_from" style="color:var(--lb-ink-3)">(von {{ shortDay(task.moved_from) }})</span>
-                            </label>
-                            <select v-if="!task.moved_to" class="atlas-day-move" value=""
-                                    :aria-label="'Task auf einen anderen Tag verschieben: ' + task.text"
-                                    @change="move(task, $event)">
-                                <option value="">⇢</option>
-                                <option v-for="d in days" :key="d.date" :value="d.date" :disabled="d.date === day.date">
-                                    {{ shortDay(d.date) }} {{ dayNumber(d.date) }}.
-                                </option>
-                            </select>
-                            <button type="button" class="atlas-icon-btn is-danger atlas-day-del"
-                                    :aria-label="'Task löschen: ' + task.text" title="Task löschen"
-                                    :disabled="removing === rowId(task)" @click="remove(task)">✕</button>
-                        </div>
-                    </div>
-                    <div class="atlas-day-foot">
-                        <input v-if="adding === day.date" :id="addId(day)" class="atlas-field" v-model="addText"
-                               :aria-label="'Neuer Task am ' + day.weekday" placeholder="Task …"
-                               @keydown.enter.prevent="createTask(day)" @keydown.esc.prevent="stopAdd" @blur="stopAdd" />
-                        <button v-else type="button" class="atlas-link-btn" @click="startAdd(day)">+ Task</button>
-                    </div>
-                </div>
-                </template>
-            </section>
-
-            <section id="atlas-review" ref="review" aria-label="Rückblick" class="atlas-review" :class="{ 'is-focused': focusReview }">
-                <div class="atlas-review-title">Rückblick bisher</div>
-                <div class="atlas-review-stats">
-                    <div><span class="atlas-review-num">{{ review.tasks.done }}</span> <span class="atlas-review-label">/ {{ review.tasks.total }} Tasks erledigt</span></div>
-                    <div><span class="atlas-review-num">{{ review.zettel.length }}</span> <span class="atlas-review-label">Zettel geschrieben</span></div>
-                    <div><span class="atlas-review-num">{{ review.goals.reached }}</span> <span class="atlas-review-label">/ {{ review.goals.total }} Wochenziele erreicht</span></div>
-                    <div><span class="atlas-review-num">{{ review.chapters.length }}</span> <span class="atlas-review-label">Kapitel bearbeitet</span></div>
-                    <div v-if="review.carried.length"><span class="atlas-review-num">{{ review.carried.length }}</span> <span class="atlas-review-label">mehrfach übertragen</span></div>
-                </div>
-                <div class="flex items-center gap-4 ml-auto">
-                    <button v-if="!goals.length && week && week.previous" type="button" class="atlas-link-btn"
-                            :disabled="savingGoals" @click="adoptGoals">Ziele der Vorwoche übernehmen</button>
-                    <router-link v-if="week" :to="'/atlas/rueckblick/' + week.week" class="atlas-link-btn">ganzer Rückblick →</router-link>
-                    <button type="button" class="atlas-link-btn" :disabled="reviewBusy || !week" @click="reviewZettel">
-                        {{ reviewBusy ? 'Legt an…' : 'Wochenrückblick als Zettel anlegen' }}
+                    <button type="button" class="atlas-text-btn" :disabled="!week" @click="openGoals">
+                        {{ goals.length ? 'Ziele bearbeiten' : 'Ziele festlegen' }}
                     </button>
+                </section>
+
+                <div v-if="goalsOpen" class="atlas-modal-backdrop" @click.self="goalsOpen = false" @keydown.esc="goalsOpen = false">
+                    <form class="atlas-modal" role="dialog" aria-modal="true" aria-labelledby="atlas-goals-h" @submit.prevent="saveGoals">
+                        <div class="atlas-new-head">
+                            <div>
+                                <h2 id="atlas-goals-h" class="atlas-modal-title">Wochenziele KW {{ week ? week.number : '' }}</h2>
+                                <p class="atlas-modal-sub">Bis zu fünf. Mit Anker oder Schlagwort zählt der Fortschritt die passenden Aufgaben der Woche, sonst das Häkchen.</p>
+                            </div>
+                            <button type="button" class="atlas-icon-square" aria-label="Schließen" @click="goalsOpen = false"><atlas-icon name="close" /></button>
+                        </div>
+                        <div class="atlas-new-form">
+                            <div v-for="(g, i) in goalDrafts" :key="i" class="atlas-goal-edit">
+                                <input type="checkbox" class="atlas-check" v-model="g.done" :aria-label="'Erreicht: ' + (g.title || 'Ziel ' + (i + 1))" />
+                                <input v-model="g.title" class="atlas-input" :aria-label="'Titel von Ziel ' + (i + 1)" placeholder="z. B. Kapitel 3 an die Betreuerin schicken" />
+                                <input v-model="g.anchor" class="atlas-input is-narrow" list="atlas-goal-entities" :aria-label="'Anker von Ziel ' + (i + 1)" placeholder="Anker, z. B. kapitel-03" />
+                                <input v-model="g.tag" class="atlas-input is-narrow" :aria-label="'Schlagwort von Ziel ' + (i + 1)" placeholder="#tag" />
+                                <button type="button" class="atlas-icon-btn is-danger" :aria-label="'Ziel ' + (i + 1) + ' entfernen'" @click="goalDrafts.splice(i, 1)">✕</button>
+                            </div>
+                            <datalist id="atlas-goal-entities">
+                                <option v-for="e in entities" :key="e.id" :value="e.id">{{ e.title }}</option>
+                            </datalist>
+                            <div class="atlas-row-gap">
+                                <button type="button" class="atlas-btn is-small" :disabled="goalDrafts.length >= 5" @click="goalDrafts.push({ title: '', anchor: '', tag: '', done: false })">
+                                    <atlas-icon name="plus" :size="16" /> Ziel hinzufügen
+                                </button>
+                                <button v-if="week && week.previous" type="button" class="atlas-btn is-small" :disabled="savingGoals" @click="adoptGoals">
+                                    Offene Ziele der Vorwoche übernehmen
+                                </button>
+                            </div>
+                        </div>
+                        <div class="atlas-new-foot">
+                            <span class="atlas-muted">Gespeichert wird nur die Kopfzeile der Wochendatei – die Aufgaben bleiben, wie sie sind.</span>
+                            <div class="atlas-row-gap">
+                                <button type="button" class="atlas-btn" @click="goalsOpen = false">Abbrechen</button>
+                                <button type="submit" class="atlas-btn is-primary" :disabled="savingGoals">{{ savingGoals ? 'Speichert…' : 'Speichern' }}</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+
+                <section v-if="tray.length" class="atlas-tray" aria-labelledby="atlas-h-tray"
+                         @dragover="onDragOver($event, 'tray')" @drop.prevent="onDropTray">
+                    <div class="atlas-tray-head">
+                        <h2 id="atlas-h-tray" class="atlas-carry-title"><atlas-icon name="clock" :size="16" /> Liegen geblieben · {{ tray.length }}</h2>
+                        <span class="atlas-muted">Offen aus den letzten Tagen – auf einen Tag ziehen, um es neu zu planen.</span>
+                    </div>
+                    <ul class="atlas-tray-list">
+                        <li v-for="c in tray" :key="c.key" class="atlas-tray-li" :class="{ 'is-dragging': dragging === c.key }"
+                            draggable="true" :data-card="c.key" @dragstart="onDragStart($event, c)" @dragend="onDragEnd">
+                            <div class="atlas-ccard" :class="c.kind === 'task' ? '' : 'is-term' + (c.overdue ? ' is-overdue' : '')">
+                                <button type="button" class="atlas-grip" :data-grip="c.key" :aria-label="gripLabel(c)"
+                                        title="Ziehen oder Alt + Pfeiltaste" @keydown="onGripKey($event, c)"><atlas-icon name="grip" :size="16" /></button>
+                                <template v-if="c.kind === 'task'">
+                                    <input type="checkbox" class="atlas-check is-small" :id="'atlas-tr-' + c.key" :checked="c.task.done" @change="toggle(c.task)" />
+                                    <div class="atlas-ccard-body">
+                                        <label :for="'atlas-tr-' + c.key" class="atlas-ccard-text">{{ c.title }}</label>
+                                        <span class="atlas-ccard-meta">{{ c.meta }}</span>
+                                    </div>
+                                </template>
+                                <template v-else>
+                                    <span class="atlas-ccard-flag"><atlas-icon :name="c.overdue ? 'alert' : 'flag'" :size="16" /></span>
+                                    <div class="atlas-ccard-body">
+                                        <span class="atlas-ccard-kicker">{{ c.kicker }}</span>
+                                        <span class="atlas-ccard-text is-strong">{{ c.title }}</span>
+                                        <span class="atlas-ccard-meta">{{ c.meta }}</span>
+                                    </div>
+                                </template>
+                            </div>
+                        </li>
+                    </ul>
+                </section>
+
+                <div class="atlas-board-scroll">
+                    <div class="atlas-calgrid">
+                        <section v-for="col in columns" :key="col.key" class="atlas-calcol"
+                                 :class="{ 'is-today': col.isToday, 'is-weekend': col.weekend, 'is-next': col.key === 'next', 'is-over': canDropOn(col.key) && overCol === col.key }"
+                                 :aria-label="col.aria" :data-col="col.key"
+                                 @dragover="onDragOver($event, col.key)" @dragleave="onDragLeave($event, col.key)" @drop="onDrop($event, col.key)">
+                            <header class="atlas-calcol-head">
+                                <template v-if="col.key !== 'next'">
+                                    <div class="atlas-calcol-day">
+                                        <span class="atlas-calcol-short">{{ col.short }}</span>
+                                        <span class="atlas-calcol-num">{{ col.num }}</span>
+                                        <span v-if="col.isToday" class="atlas-today-pill">Heute</span>
+                                    </div>
+                                    <span v-if="col.total" class="atlas-mono-sub">{{ col.done }}/{{ col.total }}</span>
+                                </template>
+                                <template v-else>
+                                    <div class="atlas-calcol-nextt">
+                                        <span class="atlas-calcol-short">Nächste Woche</span>
+                                        <span class="atlas-calcol-nextrange">{{ col.range }}</span>
+                                    </div>
+                                    <atlas-icon name="arrow" :size="16" />
+                                </template>
+                            </header>
+                            <ul class="atlas-calcards">
+                                <li v-for="c in col.cards" :key="c.key" class="atlas-cal-li"
+                                    :class="{ 'is-dragging': dragging === c.key }" :data-card="c.key"
+                                    :draggable="c.draggable ? 'true' : 'false'"
+                                    @dragstart="onDragStart($event, c)" @dragend="onDragEnd"
+                                    @dragover="onCardDragOver($event, c)" @drop="onCardDrop($event, c)">
+                                    <div class="atlas-ccard" :class="cardClass(c)">
+                                        <button v-if="c.draggable" type="button" class="atlas-grip" :data-grip="c.key"
+                                                :aria-label="gripLabel(c)" title="Ziehen oder Alt + Pfeiltaste"
+                                                @keydown="onGripKey($event, c)"><atlas-icon name="grip" :size="16" /></button>
+                                        <span v-else class="atlas-grip-space"></span>
+                                        <template v-if="c.kind === 'task'">
+                                            <input type="checkbox" class="atlas-check is-small" :id="'atlas-cc-' + c.key" :checked="c.task.done"
+                                                   :disabled="!!c.task.moved_to" @change="toggle(c.task)" />
+                                            <div class="atlas-ccard-body">
+                                                <input v-if="editing === c.key" :ref="'edit-' + c.key" v-model="editText" class="atlas-ccard-edit"
+                                                       aria-label="Aufgabentext bearbeiten" @keydown.enter.prevent="saveEdit(c)"
+                                                       @keydown.esc.prevent="editing = ''" @blur="saveEdit(c)" />
+                                                <label v-else :for="'atlas-cc-' + c.key" class="atlas-ccard-text">{{ c.title }}</label>
+                                                <span v-if="c.meta" class="atlas-ccard-meta">{{ c.meta }}</span>
+                                            </div>
+                                            <span v-if="!c.task.moved_to && editing !== c.key" class="atlas-ccard-tools">
+                                                <button type="button" class="atlas-icon-btn" :aria-label="'Aufgabe bearbeiten: ' + c.title" @click="startEdit(c)">✎</button>
+                                                <button type="button" class="atlas-icon-btn is-danger" :aria-label="'Aufgabe löschen: ' + c.title" @click="remove(c.task)">✕</button>
+                                            </span>
+                                        </template>
+                                        <template v-else>
+                                            <span class="atlas-ccard-flag"><atlas-icon :name="c.overdue ? 'alert' : 'flag'" :size="16" /></span>
+                                            <div class="atlas-ccard-body">
+                                                <span class="atlas-ccard-kicker">{{ c.kicker }}</span>
+                                                <router-link v-if="c.open" :to="c.open" class="atlas-ccard-text is-strong is-link" draggable="false">{{ c.title }}</router-link>
+                                                <span v-else class="atlas-ccard-text is-strong">{{ c.title }}</span>
+                                                <span class="atlas-ccard-meta">{{ c.meta }}</span>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </li>
+                            </ul>
+                            <div v-if="canDropOn(col.key) && overCol === col.key" class="atlas-dropzone is-small">{{ col.dropText }}</div>
+                            <p v-else-if="!col.cards.length && col.key !== 'next'" class="atlas-col-empty">Nichts geplant</p>
+                            <template v-if="col.key !== 'next'">
+                                <input v-if="adding === col.key" :id="'atlas-add-' + col.key" v-model="addText" class="atlas-input is-date"
+                                       :aria-label="'Neue Aufgabe am ' + col.long" placeholder="Aufgabe …"
+                                       @keydown.enter.prevent="createTask(col.key)" @keydown.esc.prevent="stopAdd" @blur="stopAdd" />
+                                <button v-else type="button" class="atlas-col-foot-btn is-bottom" @click="startAdd(col.key)">
+                                    <atlas-icon name="plus" :size="16" /> Aufgabe
+                                </button>
+                            </template>
+                            <p v-else class="atlas-next-drop">Hierher ziehen, um es auf nächste Woche zu schieben</p>
+                        </section>
+                    </div>
+                </div>
+            </template>
+
+            <section v-else class="atlas-panel is-padded atlas-review-panel" aria-labelledby="atlas-h-rueck">
+                <div>
+                    <h2 id="atlas-h-rueck" class="atlas-panel-title">Rückblick auf KW {{ week ? week.number : '' }}</h2>
+                    <p class="atlas-muted" style="margin:6px 0 0">Wird aus der Woche berechnet – nichts muss von Hand eingetragen werden.</p>
+                </div>
+                <div class="atlas-review-grid">
+                    <div class="atlas-review-card"><div class="atlas-review-big">{{ review.tasks.done }}<span class="atlas-tile-of"> / {{ review.tasks.total }}</span></div><div>Aufgaben erledigt</div></div>
+                    <div class="atlas-review-card"><div class="atlas-review-big">{{ review.tasks.moved }}</div><div>verschoben</div></div>
+                    <div class="atlas-review-card"><div class="atlas-review-big">{{ review.goals.reached }}<span class="atlas-tile-of"> / {{ review.goals.total }}</span></div><div>Wochenziele erreicht</div></div>
+                    <div class="atlas-review-card"><div class="atlas-review-big">{{ review.zettel.length }}</div><div>Notizen geschrieben</div></div>
+                    <div class="atlas-review-card"><div class="atlas-review-big">{{ review.chapters.length }}</div><div>Kapitel bearbeitet</div></div>
+                </div>
+                <div v-if="review.carried.length || review.zettel.length || review.chapters.length" class="atlas-review-lists">
+                    <div v-if="review.carried.length">
+                        <div class="atlas-group-label is-flat">Mehrfach übertragen</div>
+                        <ul class="atlas-notes"><li v-for="c in review.carried" :key="c.text" class="atlas-notes-row">
+                            <span class="atlas-notes-title">{{ c.text }}</span><span class="atlas-notes-when">{{ c.moves }}× verschoben</span>
+                        </li></ul>
+                    </div>
+                    <div v-if="review.zettel.length">
+                        <div class="atlas-group-label is-flat">Notizen dieser Woche</div>
+                        <ul class="atlas-notes"><li v-for="z in review.zettel" :key="z.id" class="atlas-notes-row">
+                            <router-link :to="'/atlas/zettel/' + encodeURIComponent(z.id)" class="atlas-notes-title">{{ z.title }}</router-link>
+                            <span class="atlas-notes-when">{{ dayLabel(z.date) }}</span>
+                        </li></ul>
+                    </div>
+                    <div v-if="review.chapters.length">
+                        <div class="atlas-group-label is-flat">Kapitel bearbeitet</div>
+                        <ul class="atlas-notes"><li v-for="c in review.chapters" :key="c.id" class="atlas-notes-row">
+                            <router-link :to="{ path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } }" class="atlas-notes-title">{{ c.title || c.id }}</router-link>
+                            <span class="atlas-notes-when">{{ dayLabel(c.modified_at) }}</span>
+                        </li></ul>
+                    </div>
+                </div>
+                <div class="atlas-row-gap">
+                    <button type="button" class="atlas-btn is-primary is-tall" :disabled="reviewBusy || !week" @click="reviewZettel">
+                        {{ reviewBusy ? 'Legt an…' : 'Rückblick als Notiz speichern' }}
+                    </button>
+                    <router-link :to="weekRoute" class="atlas-btn is-tall">Zurück zur Woche</router-link>
                 </div>
             </section>
         </div>
@@ -5190,31 +6900,134 @@ const AtlasWeekPage = {
     data() {
         return {
             week: null,
+            nextWeek: null,
+            today: null,
+            projects: [],
+            publications: [],
             loading: true,
+            dragging: null,
+            overCol: null,
+            busy: false,
             adding: '',
             addText: '',
-            removing: null,        // rowId des Tasks, der gerade gelöscht wird
-            editingGoal: null,     // null = keiner, -1 = neues Ziel, sonst Index
-            goalDraft: { title: '', anchor: '', tag: '', done: false },
-            savingGoals: false,
+            editing: '',
+            editText: '',
             reviewBusy: false,
-            publications: [],
-            projects: [],
-            entityListId: 'atlas-entities-' + Math.random().toString(36).slice(2, 8),
-            _es: null,
-            _timer: null,
+            goalsOpen: false,
+            goalDrafts: [],
+            savingGoals: false,
         };
     },
     computed: {
-        // Immer „Woche": der Rückblick hat seit Slice 7 eine eigene Seite, ein
-        // `?review=1` springt hier nur an den Fuß und darf die Navigation nicht
-        // auf einen Eintrag zeigen lassen, auf dem man gar nicht steht.
-        navKey() { return 'woche'; },
-        focusReview() { return this.$route.query.review === '1'; },
+        isReview() { return this.$route.path.startsWith('/atlas/rueckblick'); },
+        weekId() { return this.week ? this.week.week : ''; },
+        weekRoute() { return '/atlas/woche' + (this.weekId ? '/' + this.weekId : ''); },
+        reviewRoute() { return '/atlas/rueckblick' + (this.weekId ? '/' + this.weekId : ''); },
+        todayIso() { return (this.today && this.today.date) || atlasWork.today || atlasIso(new Date()); },
         days() { return (this.week && this.week.days) || []; },
         goals() { return (this.week && this.week.goals) || []; },
+        rangeTitle() {
+            if (this.days.length < 7) return 'Kalender';
+            const a = atlasDate(this.days[0].date);
+            const b = atlasDate(this.days[6].date);
+            const month = (d) => d.toLocaleDateString('de-DE', { month: 'long' });
+            if (a.getMonth() === b.getMonth()) return a.getDate() + '.–' + b.getDate() + '. ' + month(b);
+            return a.getDate() + '. ' + month(a) + ' – ' + b.getDate() + '. ' + month(b);
+        },
+        nextMonday() {
+            return this.days.length === 7 ? atlasAddDays(this.days[6].date, 1) : atlasNextMonday(this.todayIso);
+        },
+        isCurrentWeek() { return this.days.some((d) => d.date === this.todayIso); },
+        // Termine: Meilensteine der Projekte und Fristen offener
+        // Veröffentlichungen, mit Datum; überfällig = vor heute, nicht erledigt.
+        terms() {
+            const out = [];
+            for (const p of this.projects) {
+                (p.milestones || []).forEach((m, i) => {
+                    const date = String(m.date || '').slice(0, 10);
+                    if (!atlasDate(date)) return;
+                    out.push({
+                        key: 'ms:' + p.id + ':' + i, kind: 'milestone', date, done: !!m.done,
+                        title: m.title || 'Meilenstein', meta: p.title || p.id, project: p, index: i,
+                        open: { path: '/atlas/sammlung', query: { tab: 'projekte', proj: p.id } },
+                    });
+                });
+            }
+            for (const p of this.publications) {
+                const date = String(p.due || '').slice(0, 10);
+                if (!atlasDate(date) || ATLAS_PIPELINE_CLOSED.has(p.status) || p.status === 'published') continue;
+                out.push({
+                    key: 'due:' + p.id, kind: 'deadline', date, done: false,
+                    title: p.title, meta: 'Veröffentlichung', publication: p,
+                    open: atlasPublicationRoute(p.id),
+                });
+            }
+            for (const t of out) {
+                t.overdue = !t.done && t.date < this.todayIso;
+                const label = t.kind === 'milestone' ? 'Meilenstein' : 'Frist';
+                t.kicker = label + (t.overdue ? ' · überfällig' : '');
+                t.draggable = !t.done;
+            }
+            return out;
+        },
+        tray() {
+            if (!this.isCurrentWeek) return [];
+            // Offenes aus früheren Tagen DIESER Woche steht schon in seiner
+            // Spalte — die Leiste trägt nur, was davor liegen blieb.
+            const first = this.days[0].date;
+            const tasks = ((this.today && this.today.carry_over) || [])
+                .filter((t) => !t.day || t.day < first)
+                .map((t) => this.taskCard(t, true));
+            const overdue = this.terms.filter((t) => t.overdue && t.date < this.days[0].date)
+                .map((t) => ({ ...t, meta: t.meta + ' · fällig war ' + atlasDayLabel(t.date) }));
+            return [...overdue, ...tasks];
+        },
+        columns() {
+            const cols = this.days.map((d) => {
+                const tasks = (d.tasks || []).map((t) => this.taskCard(t, false));
+                const terms = this.terms.filter((t) => t.date === d.date);
+                const open = (d.tasks || []).filter((t) => !t.moved_to);
+                return {
+                    key: d.date,
+                    short: atlasShortDay(d.date),
+                    num: atlasDate(d.date).getDate(),
+                    long: atlasDayLong(d.date),
+                    isToday: d.date === this.todayIso,
+                    weekend: (atlasDate(d.date).getDay() % 6) === 0,
+                    cards: [...terms, ...tasks],
+                    total: open.length,
+                    done: open.filter((t) => t.done).length,
+                    dropText: 'Auf ' + atlasDayLabel(d.date) + ' legen',
+                    aria: atlasDayLong(d.date) + ', ' + open.length + ' Aufgaben',
+                };
+            });
+            if (cols.length) {
+                const nextDays = new Set();
+                for (let i = 0; i < 7; i += 1) nextDays.add(atlasAddDays(this.nextMonday, i));
+                const nextTasks = ((this.nextWeek && this.nextWeek.tasks) || [])
+                    .filter((t) => !t.moved_to).map((t) => this.taskCard(t, false));
+                const nextTerms = this.terms.filter((t) => nextDays.has(t.date))
+                    .map((t) => ({ ...t, kicker: t.kicker + ' · ' + atlasDayLabel(t.date) }));
+                const end = atlasAddDays(this.nextMonday, 6);
+                cols.push({
+                    key: ATLAS_NEXT,
+                    range: 'KW ' + this.weekNumberOf(this.week && this.week.next) + ' · '
+                        + atlasDate(this.nextMonday).getDate() + '.–' + atlasDate(end).getDate() + '.',
+                    cards: [...nextTerms, ...nextTasks],
+                    dropText: 'In KW ' + this.weekNumberOf(this.week && this.week.next) + ' schieben',
+                    aria: 'Nächste Woche',
+                });
+            }
+            return cols;
+        },
+        allCards() {
+            const out = {};
+            for (const c of this.tray) out[c.key] = c;
+            for (const col of this.columns) for (const c of col.cards) out[c.key] = c;
+            return out;
+        },
+        dragCard() { return this.dragging ? this.allCards[this.dragging] || null : null; },
         entities() { return atlasWork.entities; },
-        todayIso() { return atlasWork.today; },
         review() {
             const r = (this.week && this.week.review) || {};
             return {
@@ -5225,275 +7038,397 @@ const AtlasWeekPage = {
                 carried: r.carried || [],
             };
         },
-        range() {
-            if (this.days.length < 7) return '';
-            const a = atlasDate(this.days[0].date);
-            const b = atlasDate(this.days[6].date);
-            if (!a || !b) return '';
-            return a.getDate() + '. – ' + b.toLocaleDateString('de-DE', { day: 'numeric', month: 'long', year: 'numeric' });
-        },
     },
     methods: {
-        shortDay(iso) { return atlasShortDay(iso); },
-        dayNumber(iso) { const d = atlasDate(iso); return d ? d.getDate() : ''; },
-        weekNumberOf(week) { const m = /W(\d{2})/.exec(week || ''); return m ? Number(m[1]) : ''; },
-        rowId(task) { return 'atlas-w-' + task.week + '-' + task.body_index; },
-        addId(day) { return 'atlas-add-' + day.date; },
-        goalReached(goal) { return !!goal.done || (goal.total > 0 && goal.done_count === goal.total); },
-        goalCount(goal) {
-            if (goal.total) return goal.done_count + '/' + goal.total;
-            return goal.done ? 'erledigt' : 'offen';
+        weekNumberOf(week) { return atlasWeekNumber(week); },  // fürs Template
+        // --- Wochenziele (Kopfzeile der Wochendatei, ADR-0020) -------------
+        openGoals() {
+            this.goalDrafts = this.goals.map((g) => ({
+                title: g.title || '', anchor: g.anchor || '', tag: g.tag ? '#' + g.tag : '', done: !!g.done,
+            }));
+            if (!this.goalDrafts.length) this.goalDrafts.push({ title: '', anchor: '', tag: '', done: false });
+            this.goalsOpen = true;
         },
-        goalPercent(goal) { return Math.round((goal.progress || 0) * 100) + '%'; },
-        // Story 28: fällt eine Frist der verankerten Veröffentlichung oder ein
-        // Meilenstein des verankerten Projekts in diese Woche, steht sie am Ziel.
-        deadline(goal) {
-            if (!goal.anchor || this.days.length < 7) return '';
-            const inWeek = new Set(this.days.map((d) => d.date));
-            const pub = this.publications.find((p) => p.id === goal.anchor);
-            if (pub && pub.due && inWeek.has(String(pub.due).slice(0, 10))) {
-                return 'Frist ' + atlasShortDate(pub.due);
-            }
-            const proj = this.projects.find((p) => p.id === goal.anchor);
-            if (proj) {
-                const ms = (proj.milestones || []).find((m) => m.date && inWeek.has(String(m.date).slice(0, 10)));
-                if (ms) return 'Meilenstein „' + ms.title + '" ' + atlasShortDate(ms.date);
-            }
-            return '';
-        },
-        goalMeta(goal) {
-            const parts = [];
-            if (goal.anchor) {
-                const e = atlasEntity(goal.anchor);
-                parts.push('Anker: ' + ((e && e.title) || goal.anchor));
-            }
-            if (goal.tag) parts.push('Tag: #' + goal.tag);
-            if (goal.total) parts.push(goal.total + (goal.total === 1 ? ' Task' : ' Tasks') + ' diese Woche');
-            const due = this.deadline(goal);
-            if (due) parts.push(due);
-            return parts.length ? parts.join(' · ') : 'Ohne Anker und Tag — Fortschritt ist das Häkchen.';
-        },
-        taskUrl(task) {
-            return '/api/plugins/atlas/journal/' + encodeURIComponent(task.week)
-                + '/tasks/' + encodeURIComponent(task.body_index);
-        },
-        weekUrl(suffix) {
-            return '/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + suffix;
-        },
-        async load(silent = false) {
-            if (!silent) this.loading = true;
-            let id = this.$route.params.week;
-            if (!id) {
-                if (!atlasWork.week) await atlasRefreshToday();
-                id = atlasWork.week;
-            }
-            if (!id) { this.loading = false; return; }
+        async saveGoals() {
+            if (!this.week || this.savingGoals) return;
+            const goals = this.goalDrafts
+                .filter((g) => g.title.trim())
+                .map((g) => ({
+                    title: g.title.trim(),
+                    anchor: g.anchor.trim() || null,
+                    tag: g.tag.trim().replace(/^#/, '') || null,
+                    done: !!g.done,
+                }));
+            this.savingGoals = true;
             try {
-                this.week = await api('/api/plugins/atlas/journal/' + encodeURIComponent(id));
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/goals', {
+                    method: 'PUT', body: JSON.stringify({ goals }),
+                });
+                this.goalsOpen = false;
+                atlasToast('Wochenziele gespeichert.');
             } catch (e) {
-                // Ein stilles Nachladen darf niemals einen Dialog aufreißen:
-                // es läuft im Hintergrund, während jemand tippt.
-                if (!silent) alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
+            this.savingGoals = false;
+            await this.load(true);
+        },
+        async adoptGoals() {
+            if (!this.week || this.savingGoals) return;
+            this.savingGoals = true;
+            try {
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/goals/adopt', { method: 'POST' });
+                await this.load(true);
+                this.openGoals();
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.savingGoals = false;
+        },
+        routeFor(week) { return (this.isReview ? '/atlas/rueckblick' : '/atlas/woche') + (week ? '/' + week : ''); },
+        dayLabel(iso) { return atlasDayLabel(String(iso || '').slice(0, 10)); },
+        goalReached(g) { return !!g.done || (g.total > 0 && g.done_count === g.total); },
+        goalPercent(g) { return Math.round((g.progress || 0) * 100) + '%'; },
+        cardClass(c) {
+            if (c.kind === 'task') return { 'is-done': c.task.done, 'is-moved': !!c.task.moved_to };
+            return { 'is-term': true, 'is-overdue': c.overdue, 'is-done': c.done };
+        },
+        gripLabel(c) {
+            const what = c.kind === 'task' ? 'Aufgabe' : (c.kind === 'milestone' ? 'Meilenstein' : 'Frist');
+            return what + ' verschieben: ' + c.title;
+        },
+        // Eine Aufgabe als Karte. `fromTray`: aus „Liegen geblieben" (offen seit …).
+        taskCard(t, fromTray) {
+            const meta = [];
+            for (const a of t.anchors || []) {
+                const e = atlasEntity(a);
+                meta.push((e && e.title) || a);
+            }
+            for (const tag of t.tags || []) meta.push('#' + tag);
+            if (fromTray && t.day) meta.push('offen seit ' + atlasDayLabel(t.day));
+            if (t.moved_from) meta.push('von ' + atlasDayLabel(t.moved_from));
+            if (t.moved_to) meta.push('→ ' + atlasDayLabel(t.moved_to));
+            return {
+                key: 't:' + t.week + '#' + t.body_index,
+                kind: 'task',
+                task: t,
+                title: t.text || '(leere Zeile)',
+                meta: meta.join(' · '),
+                date: t.day,
+                draggable: !t.done && !t.moved_to,
+            };
+        },
+        canDropOn(key) {
+            const c = this.dragCard;
+            if (!c || key === 'tray') return false;
+            if (key === ATLAS_NEXT) return true;
+            return c.date !== key;
+        },
+        targetDate(key) { return key === ATLAS_NEXT ? this.nextMonday : key; },
+        // --- Laden ----------------------------------------------------------
+        // `kinds` (stilles Nachladen) beschränkt auf das Betroffene: Heute und
+        // die Wochen (Aufgaben; der Rückblick zählt auch Notizen, Ideen und
+        // Kapitel), Termine der Projekte, Fristen der Veröffentlichungen.
+        // Ohne `kinds` alles.
+        async load(silent = false, kinds = null) {
+            if (!silent) this.loading = true;
+            const journal = atlasTouches(kinds, ['journal', 'zettel', 'idea', 'diss_node']);
+            const withProjects = atlasTouches(kinds, ['project', 'collection']);
+            const withPubs = atlasTouches(kinds, ['publication', 'collection']);
+            if (journal) {
+                let id = this.$route.params.week;
+                const today = await atlasRefreshToday();
+                if (today) this.today = today;
+                if (!id) id = atlasWork.week;
+                if (!id) { this.loading = false; return; }
+                try {
+                    this.week = await api('/api/plugins/atlas/journal/' + encodeURIComponent(id));
+                } catch (e) {
+                    if (!silent) atlasToast(atlasErrorText(e), { tone: 'danger' });
+                }
+            }
+            const [next, projects, pubs] = await Promise.all([
+                journal && this.week ? api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.next)).catch(() => null) : null,
+                withProjects ? api('/api/plugins/atlas/projects').catch(() => null) : null,
+                withPubs ? api('/api/plugins/atlas/publications').catch(() => null) : null,
+            ]);
+            if (journal) this.nextWeek = next;
+            if (projects) this.projects = projects.projects || [];
+            if (pubs) this.publications = pubs.publications || [];
             this.loading = false;
         },
-        scheduleReload() {
-            if (this._timer) clearTimeout(this._timer);
-            this._timer = setTimeout(() => { this._timer = null; this.load(true); }, 200);
-        },
-        // Die Frist-Hinweise (Story 28) brauchen Veröffentlichungen und Projekte;
-        // beides ist eine kleine Liste und wird still geladen.
-        async loadContext() {
+        reloadFor(kinds) { return this.load(true, kinds); },
+        // --- Drag & Drop ----------------------------------------------------
+        onDragStart(e, c) {
+            if (!c.draggable) { e.preventDefault(); return; }
             try {
-                const [pubs, projs] = await Promise.all([
-                    api('/api/plugins/atlas/publications'),
-                    api('/api/plugins/atlas/projects'),
-                ]);
-                this.publications = pubs.publications || [];
-                this.projects = projs.projects || [];
-            } catch (e) { /* Hinweise sind Beiwerk, kein Grund für einen Fehler */ }
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', c.key);
+            } catch (err) { /* ignore */ }
+            this.dragging = c.key;
         },
-        async toggle(task) {
-            const before = task.done;
-            task.done = !before;
-            task.open = !task.done && !task.moved_to;
+        onDragEnd() { this.dragging = null; this.overCol = null; },
+        onDragOver(e, key) {
+            if (!this.dragging) return;
+            e.preventDefault();
+            try { e.dataTransfer.dropEffect = 'move'; } catch (err) { /* ignore */ }
+            this.overCol = key;
+        },
+        onDragLeave(e, key) {
+            const to = e.relatedTarget;
+            if (to && e.currentTarget && e.currentTarget.contains(to)) return;
+            if (this.overCol === key) this.overCol = null;
+        },
+        draggedKey(e) {
+            if (this.dragging) return this.dragging;
+            try { return e.dataTransfer.getData('text/plain') || null; } catch (err) { return null; }
+        },
+        async onDrop(e, key) {
+            e.preventDefault();
+            e.stopPropagation();
+            const card = this.allCards[this.draggedKey(e)];
+            this.onDragEnd();
+            if (card) await this.moveCard(card, key);
+        },
+        onDropTray(e) { e.stopPropagation(); this.onDragEnd(); },
+        // Innerhalb eines Tages: auf eine andere Aufgabe fallen lassen ändert
+        // die Reihenfolge (bestehender Reorder-Endpunkt).
+        onCardDragOver(e, target) {
+            const card = this.dragCard;
+            if (!card || card.kind !== 'task' || target.kind !== 'task') return;
+            if (card.task.week !== target.task.week || card.task.day !== target.task.day) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.overCol = null;
+        },
+        async onCardDrop(e, target) {
+            const card = this.allCards[this.draggedKey(e)];
+            if (!card || card.kind !== 'task' || target.kind !== 'task') return;
+            if (card.task.week !== target.task.week || card.task.day !== target.task.day) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.onDragEnd();
+            if (card.key === target.key) return;
+            await this.reorder(card.task, target.task);
+        },
+        onGripKey(e, c) {
+            if (!e.altKey || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+            e.preventDefault();
+            const order = this.days.map((d) => d.date).concat([ATLAS_NEXT]);
+            let idx;
+            const inWeek = order.indexOf(c.date);
+            if (inWeek < 0) {
+                // Aus „Liegen geblieben" oder der Folgewoche: → legt auf heute
+                // bzw. den Sonntag, ← schiebt einen Tag früher.
+                const step = e.key === 'ArrowRight' ? 1 : -1;
+                const target = c.date && c.date >= this.nextMonday
+                    ? atlasAddDays(c.date, step)
+                    : (step > 0 ? (this.isCurrentWeek ? this.todayIso : this.days[0].date) : null);
+                if (target) this.moveCard(c, target, true);
+                return;
+            }
+            idx = inWeek + (e.key === 'ArrowRight' ? 1 : -1);
+            if (idx < 0) return;
+            this.moveCard(c, order[idx], true);
+        },
+        // --- Verschieben mit Rückgängig ------------------------------------
+        async moveCard(card, key, keepFocus = false) {
+            const to = this.targetDate(key);
+            if (!to || to === card.date || this.busy) return;
+            this.busy = true;
+            const where = key === ATLAS_NEXT
+                ? 'liegt jetzt in KW ' + this.weekNumberOf(this.week && this.week.next) + '.'
+                : 'liegt jetzt auf ' + atlasDayLong(to) + '.';
             try {
-                await api(this.taskUrl(task) + '/toggle', { method: 'POST' });
-                await this.load(true);
-                atlasRefreshToday();
+                if (card.kind === 'task') await this.moveTask(card, to, where);
+                else await this.moveTerm(card, to, where);
             } catch (e) {
-                task.done = before;
-                task.open = !before && !task.moved_to;
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busy = false;
+            await this.load(true);
+            if (keepFocus) this.focusAfterMove(card, to);
+        },
+        async moveTask(card, to, where) {
+            const t = card.task;
+            const res = await api('/api/plugins/atlas/journal/' + encodeURIComponent(t.week) + '/tasks/'
+                + encodeURIComponent(t.body_index) + '/move', { method: 'POST', body: JSON.stringify({ to }) });
+            atlasToast('„' + card.title + '“ ' + where, {
+                actionLabel: 'Rückgängig',
+                action: async () => {
+                    try {
+                        await api('/api/plugins/atlas/journal/' + encodeURIComponent(res.source_week) + '/tasks/'
+                            + encodeURIComponent(res.source_index) + '/undo-move', {
+                            method: 'POST', body: JSON.stringify({ to_week: res.week, to_index: res.body_index }),
+                        });
+                        atlasToast('Verschieben rückgängig gemacht.');
+                    } catch (e) {
+                        atlasToast(e && e.message === 'error.atlas.move_changed'
+                            ? 'Die Aufgabe wurde seither geändert – zieh sie einfach zurück auf ' + atlasDayLabel(card.date) + '.'
+                            : atlasErrorText(e), { tone: 'danger' });
+                    }
+                    await this.load(true);
+                },
+            });
+        },
+        async writeTermDate(card, date) {
+            if (card.kind === 'milestone') {
+                const milestones = (card.project.milestones || []).map((m, i) => ({
+                    title: m.title, date: i === card.index ? date : (m.date || null), done: !!m.done,
+                }));
+                await api('/api/plugins/atlas/projects/' + encodeURIComponent(card.project.id), {
+                    method: 'PUT', body: JSON.stringify({ milestones }),
+                });
+            } else {
+                await api('/api/plugins/atlas/publications/' + encodeURIComponent(card.publication.id), {
+                    method: 'PUT', body: JSON.stringify({ due: date }),
+                });
             }
         },
-        async move(task, event) {
-            const to = event.target.value;
-            event.target.value = '';
-            if (!to) return;
+        async moveTerm(card, to, where) {
+            const before = card.date;
+            await this.writeTermDate(card, to);
+            atlasToast('„' + card.title + '“ ' + where, {
+                actionLabel: 'Rückgängig',
+                action: async () => {
+                    try {
+                        // Die Liste neu lesen: ein anderes Datum der Meilensteine
+                        // darf das Zurückschreiben nicht überschreiben.
+                        await this.load(true);
+                        const fresh = this.terms.find((t) => t.key === card.key) || card;
+                        await this.writeTermDate(fresh, before);
+                        atlasToast('Verschieben rückgängig gemacht.');
+                    } catch (e) {
+                        atlasToast(atlasErrorText(e), { tone: 'danger' });
+                    }
+                    await this.load(true);
+                },
+            });
+        },
+        focusAfterMove(card, to) {
+            this.$nextTick(() => {
+                const col = this.columns.find((c) => c.key === to || (c.key === ATLAS_NEXT && to >= this.nextMonday));
+                if (!col) return;
+                const same = col.cards.find((c) => c.title === card.title && c.draggable);
+                const grip = same && this.$el.querySelector('[data-grip="' + same.key + '"]');
+                if (grip) grip.focus();
+            });
+        },
+        async reorder(task, target) {
+            const sameDay = this.days.find((d) => d.date === task.day);
+            const list = ((sameDay && sameDay.tasks) || []);
+            const position = list.findIndex((t) => t.body_index === target.body_index);
+            if (position < 0) return;
             try {
-                await api(this.taskUrl(task) + '/move', { method: 'POST', body: JSON.stringify({ to }) });
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(task.week) + '/tasks/'
+                    + encodeURIComponent(task.body_index) + '/reorder', { method: 'POST', body: JSON.stringify({ position }) });
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             await this.load(true);
-            atlasRefreshToday();
         },
-        // Schnell löschen ohne Rückfrage, wie auf Heute: die Zeile ist eine
-        // Zeile in der Wochendatei, kein Eintrag mit eigener Geschichte.
-        async remove(task) {
-            const key = this.rowId(task);
-            if (this.removing) return;
-            this.removing = key;
+        // --- Aufgaben -------------------------------------------------------
+        taskUrl(t) {
+            return '/api/plugins/atlas/journal/' + encodeURIComponent(t.week) + '/tasks/' + encodeURIComponent(t.body_index);
+        },
+        async toggle(t) {
             try {
-                await api(this.taskUrl(task), { method: 'DELETE' });
+                await api(this.taskUrl(t) + '/toggle', { method: 'POST' });
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
-            this.removing = null;
             await this.load(true);
-            atlasRefreshToday();
+        },
+        async remove(t) {
+            try {
+                await api(this.taskUrl(t), { method: 'DELETE' });
+                atlasToast('Aufgabe gelöscht.');
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            await this.load(true);
+        },
+        startEdit(c) {
+            this.editing = c.key;
+            this.editText = c.task.raw || c.task.text || '';
+            this.$nextTick(() => {
+                const el = this.$refs['edit-' + c.key];
+                const input = Array.isArray(el) ? el[0] : el;
+                if (input) input.focus();
+            });
+        },
+        async saveEdit(c) {
+            if (this.editing !== c.key) return;
+            const text = this.editText.trim();
+            this.editing = '';
+            if (!text || text === (c.task.raw || '')) return;
+            try {
+                await api(this.taskUrl(c.task), { method: 'PUT', body: JSON.stringify({ text }) });
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            await this.load(true);
         },
         startAdd(day) {
-            this.adding = day.date;
+            this.adding = day;
             this.addText = '';
             this.$nextTick(() => {
-                const el = document.getElementById(this.addId(day));
+                const el = document.getElementById('atlas-add-' + day);
                 if (el) el.focus();
             });
         },
         stopAdd() { this.adding = ''; this.addText = ''; },
         async createTask(day) {
             const text = this.addText.trim();
-            if (!text) { this.stopAdd(); return; }
+            if (!text || !this.week) { this.stopAdd(); return; }
             this.addText = '';
             try {
-                await api(this.weekUrl('/tasks'), {
-                    method: 'POST',
-                    body: JSON.stringify({ day: day.date, text }),
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/tasks', {
+                    method: 'POST', body: JSON.stringify({ day, text }),
                 });
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             await this.load(true);
-            atlasRefreshToday();
-            // Offen lassen: eine Woche plant man in mehreren Zeilen hintereinander.
             this.$nextTick(() => {
-                const el = document.getElementById(this.addId(day));
+                const el = document.getElementById('atlas-add-' + day);
                 if (el) el.focus();
             });
         },
-        addGoal() {
-            if (!this.week || this.goals.length >= 5) return;
-            this.editingGoal = -1;
-            this.goalDraft = { title: '', anchor: '', tag: '', done: false };
-            this.$nextTick(() => { if (this.$refs.newGoal) this.$refs.newGoal.focus(); });
-        },
-        editGoal(goal) {
-            this.editingGoal = goal.index;
-            this.goalDraft = {
-                title: goal.title || '',
-                anchor: goal.anchor || '',
-                tag: goal.tag || '',
-                done: !!goal.done,
-            };
-        },
-        cancelGoal() { this.editingGoal = null; },
-        goalList() {
-            return this.goals.map((g) => ({
-                title: g.title,
-                anchor: g.anchor || null,
-                tag: g.tag || null,
-                done: !!g.done,
-            }));
-        },
-        async putGoals(list) {
-            if (!this.week) return;
-            this.savingGoals = true;
-            try {
-                await api(this.weekUrl('/goals'), { method: 'PUT', body: JSON.stringify({ goals: list }) });
-                this.editingGoal = null;
-            } catch (e) {
-                alert(atlasErrorText(e));
-            }
-            this.savingGoals = false;
-            await this.load(true);
-        },
-        async saveGoal() {
-            const draft = {
-                title: this.goalDraft.title.trim(),
-                anchor: this.goalDraft.anchor.trim() || null,
-                tag: this.goalDraft.tag.trim().replace(/^#/, '') || null,
-                done: !!this.goalDraft.done,
-            };
-            if (!draft.title || this.savingGoals) return;
-            const list = this.goalList();
-            if (this.editingGoal >= 0) list[this.editingGoal] = draft;
-            else list.push(draft);
-            await this.putGoals(list);
-        },
-        async deleteGoal(index) {
-            const list = this.goalList().filter((_, i) => i !== index);
-            await this.putGoals(list);
-        },
-        async toggleGoal(index) {
+        // Die Markdown-Datei der Woche im Systemeditor (bestehender Endpunkt).
+        async openWeekFile() {
             if (!this.week) return;
             try {
-                await api(this.weekUrl('/goals/' + index + '/toggle'), { method: 'POST' });
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/open', { method: 'POST' });
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
-            await this.load(true);
-        },
-        async adoptGoals() {
-            if (this.savingGoals || !this.week) return;
-            this.savingGoals = true;
-            try {
-                await api(this.weekUrl('/goals/adopt'), { method: 'POST' });
-            } catch (e) {
-                alert(atlasErrorText(e));
-            }
-            this.savingGoals = false;
-            await this.load(true);
         },
         async reviewZettel() {
             if (this.reviewBusy || !this.week) return;
             this.reviewBusy = true;
             try {
-                const created = await api(this.weekUrl('/review/zettel'), { method: 'POST' });
+                const created = await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/review/zettel', { method: 'POST' });
                 await atlasLoadEntities(true);
-                if (created && created.id) this.$router.push('/atlas/zettel/' + encodeURIComponent(created.id));
+                if (created && created.id) {
+                    atlasToast('Rückblick als Notiz gespeichert.');
+                    this.$router.push('/atlas/zettel/' + encodeURIComponent(created.id));
+                }
             } catch (e) {
-                alert(atlasErrorText(e));
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
             }
             this.reviewBusy = false;
-        },
-        onCaptured() { this.load(true); },
-        scrollToReview() {
-            if (!this.focusReview) return;
-            this.$nextTick(() => {
-                const el = this.$refs.review;
-                if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            });
         },
     },
     watch: {
         '$route.params.week'() { this.load(); },
-        '$route.query.review'() { this.scrollToReview(); },
     },
-    async mounted() {
+    mounted() {
         atlasLoadEntities();
-        if (!atlasWork.today) atlasRefreshToday();
-        this.loadContext();
-        await this.load();
-        this.scrollToReview();
-        this._es = atlasConnectEvents((kind) => {
-            if (!kind || kind === 'journal' || kind === 'zettel') this.scheduleReload();
-        });
+        this.load();
+        this._live = atlasLiveReload((kinds) => this.reloadFor(kinds));
     },
     beforeUnmount() {
-        if (this._es) { this._es.close(); this._es = null; }
-        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+        if (this._live) { this._live.close(); this._live = null; }
     },
 };
 
@@ -5502,7 +7437,7 @@ const ATLAS_ZETTEL_TYPES = {
     meeting: 'Besprechung',
     method: 'Methode',
     decision: 'Entscheidung',
-    fleeting: 'Flüchtig',
+    fleeting: 'Gedanke',
     review: 'Rückblick',
 };
 
@@ -5563,31 +7498,24 @@ const AtlasChips = {
 const AtlasZettelPage = {
     components: {
         'atlas-nav': AtlasNav,
+        'atlas-header': AtlasHeader,
         'atlas-capture': AtlasCapture,
         'atlas-anchor-chip': AtlasAnchorChip,
         'atlas-backlinks': AtlasBacklinks,
         'atlas-chips': AtlasChips,
     },
     template: `
-        <div class="p-6 atlas-page">
+        <div class="atlas-page atlas-shell" lang="de">
+            <atlas-header kicker="Atlas · Ideen & Notizen" title="Notizen" new-type="note"
+                          subtitle="Notizen halten fest, was du gelesen, besprochen oder entschieden hast: Lektüre, Besprechung, Methode, Entscheidung, Gedanke, Rückblick." />
             <atlas-nav active="zettel" />
-
-            <div class="atlas-head">
-                <div>
-                    <div class="atlas-kicker">Sammlung · Wissen</div>
-                    <h1 class="atlas-title">Zettel</h1>
-                </div>
-                <div class="atlas-actions">
-                    <span class="atlas-sec-note">Lektüre, Besprechung, Methode, Entscheidung, Flüchtiges, Rückblick</span>
-                </div>
-            </div>
 
             <atlas-capture initial-mode="zettel" @created="onCaptured" />
 
             <div class="atlas-split">
                 <!-- ── Liste ───────────────────────────────────────────── -->
-                <aside class="atlas-list-rail" aria-label="Zettel-Liste">
-                    <label class="sr-only" :for="searchId">Zettel durchsuchen</label>
+                <aside class="atlas-list-rail" aria-label="Liste der Notizen">
+                    <label class="sr-only" :for="searchId">Notizen durchsuchen</label>
                     <input :id="searchId" type="search" class="atlas-field" :value="query"
                            placeholder="Suchen … Titel, Text, refs, Tags"
                            @input="onSearch($event.target.value)" @keydown.esc.prevent="onSearch('')" />
@@ -5609,8 +7537,8 @@ const AtlasZettelPage = {
                     </div>
                     <div v-else class="atlas-card">
                         <p v-if="!list.length" class="atlas-empty">
-                            <template v-if="query || type">Kein Zettel passt zu dieser Suche.</template>
-                            <template v-else>Noch kein Zettel. Das Erfassen-Feld oben legt im Modus „Zettel" einen an.</template>
+                            <template v-if="query || type">Keine Notiz passt zu dieser Suche.</template>
+                            <template v-else>Noch keine Notiz. Das Erfassen-Feld oben legt im Modus „Notiz" eine an.</template>
                         </p>
                         <router-link v-for="(z, i) in list" :key="z.id" class="atlas-list-row atlas-enter"
                                      :class="{ 'is-active': z.id === id }" :style="{ '--lb-i': i }"
@@ -5623,15 +7551,15 @@ const AtlasZettelPage = {
                         </router-link>
                     </div>
                     <p class="atlas-sec-note">
-                        Jeder Zettel ist eine Datei in <code>zettel/</code> — extern geschrieben oder hier,
+                        Jede Notiz ist eine Datei in <code>zettel/</code> — extern geschrieben oder hier,
                         derselbe Weg.
                     </p>
                 </aside>
 
                 <!-- ── Detail ──────────────────────────────────────────── -->
-                <main class="atlas-detail" aria-label="Zettel">
+                <main class="atlas-detail" aria-label="Notiz">
                     <div v-if="!id" class="atlas-card atlas-empty" style="min-height:220px; display:flex; align-items:center; justify-content:center; text-align:center;">
-                        Wähle links einen Zettel — oder schreib oben eine Zeile und leg einen neuen an.
+                        Wähle links eine Notiz — oder schreib oben eine Zeile und leg eine neue an.
                     </div>
 
                     <div v-else-if="detailLoading" class="flex flex-col gap-3">
@@ -5641,7 +7569,7 @@ const AtlasZettelPage = {
                     </div>
 
                     <div v-else-if="!zettel" class="atlas-card atlas-empty">
-                        Diesen Zettel gibt es nicht (mehr).
+                        Diese Notiz gibt es nicht (mehr).
                         <router-link to="/atlas/zettel" class="atlas-link-btn" style="text-decoration:none">Zur Liste</router-link>
                     </div>
 
@@ -5649,7 +7577,7 @@ const AtlasZettelPage = {
                         <div class="atlas-detail-head">
                             <div class="min-w-0 flex flex-col gap-2">
                                 <div class="atlas-detail-meta">
-                                    <select class="atlas-select" v-model="draft.type" aria-label="Art des Zettels">
+                                    <select class="atlas-select" v-model="draft.type" aria-label="Art der Notiz">
                                         <option v-for="t in typeList" :key="t.key" :value="t.key">{{ t.label }}</option>
                                     </select>
                                     <input type="date" class="atlas-select" v-model="draft.date" aria-label="Datum" />
@@ -5657,13 +7585,13 @@ const AtlasZettelPage = {
                                 </div>
                                 <label class="sr-only" :for="titleId">Titel</label>
                                 <input :id="titleId" class="atlas-detail-title" v-model="draft.title"
-                                       placeholder="Titel des Zettels" @keydown.enter.prevent="saveNow" />
+                                       placeholder="Titel der Notiz" @keydown.enter.prevent="saveNow" />
                             </div>
                             <div class="atlas-actions">
                                 <span class="atlas-save" :class="saveClass">{{ saveLabel }}</span>
                                 <button type="button" class="atlas-pill" :disabled="saveState === 'saving' || !dirty" @click="saveNow">Speichern</button>
                                 <button type="button" class="atlas-pill" :disabled="promoting || !!zettel.promoted_to"
-                                        :title="zettel.promoted_to ? 'Ist schon eine Idee' : 'Aus diesem Zettel eine Idee machen'"
+                                        :title="zettel.promoted_to ? 'Ist schon eine Idee' : 'Aus dieser Notiz eine Idee machen'"
                                         @click="promote">
                                     {{ promoting ? 'Legt an…' : 'Zu Idee weiterentwickeln' }}
                                 </button>
@@ -5676,7 +7604,7 @@ const AtlasZettelPage = {
                             <router-link :to="{ path: '/atlas/sammlung', query: { tab: 'ideen', idea: zettel.promoted_to } }">
                                 {{ ideaTitle(zettel.promoted_to) }}
                             </router-link>
-                            — der Zettel bleibt, wie er ist.
+                            — die Notiz bleibt, wie sie ist.
                         </div>
                         <p v-if="saveError" class="atlas-error">{{ saveError }}</p>
 
@@ -5711,7 +7639,7 @@ const AtlasZettelPage = {
                                 </div>
                             </div>
                             <textarea v-if="view === 'write'" ref="body" class="atlas-body-edit" v-model="draft.body"
-                                      aria-label="Text des Zettels" spellcheck="true"
+                                      aria-label="Text der Notiz" spellcheck="true"
                                       placeholder="Markdown. Verweise per [[kapitel-03]], Vereinbartes als Checkliste: - [ ] …"
                                       @focus="bodyFocused = true" @blur="bodyFocused = false"></textarea>
                             <div v-else class="atlas-card atlas-body-read">
@@ -5724,7 +7652,7 @@ const AtlasZettelPage = {
 
                         <section v-if="checklist.length" class="atlas-sec">
                             <div class="atlas-sec-head">
-                                <h2 class="atlas-sec-title">Vereinbart → Tasks</h2>
+                                <h2 class="atlas-sec-title">Vereinbart → Aufgaben</h2>
                                 <span class="atlas-sec-note">{{ derivable.length ? derivable.length + ' noch nicht im Journal' : 'alles abgeleitet' }}</span>
                             </div>
                             <div class="atlas-card">
@@ -5741,7 +7669,7 @@ const AtlasZettelPage = {
                                 <div class="atlas-derive-foot">
                                     <button type="button" class="atlas-pill is-strong"
                                             :disabled="deriving || !selected.length" @click="deriveTasks">
-                                        {{ deriving ? 'Legt an…' : 'Als Tasks für heute anlegen' }}
+                                        {{ deriving ? 'Legt an…' : 'Als Aufgaben für heute anlegen' }}
                                     </button>
                                     <button type="button" class="atlas-link-btn" :disabled="!derivable.length" @click="selectAllDerivable">
                                         alle offenen wählen
@@ -5825,7 +7753,7 @@ const AtlasZettelPage = {
     },
     methods: {
         shortDate(iso) { return atlasShortDate(iso); },
-        typeLabel(type) { return ATLAS_ZETTEL_TYPES[type] || type || 'Flüchtig'; },
+        typeLabel(type) { return ATLAS_ZETTEL_TYPES[type || 'fleeting'] || type; },
         typeCount(key) { return this.all.filter((z) => (z.type || 'fleeting') === key).length; },
         rowMeta(z) {
             const parts = [this.typeLabel(z.type)];
@@ -6005,7 +7933,7 @@ const AtlasZettelPage = {
                 const made = (res.created || []).length;
                 const dup = (res.already || []).length;
                 this.deriveMessage = made
-                    ? made + (made === 1 ? ' Task' : ' Tasks') + ' für heute angelegt'
+                    ? made + (made === 1 ? ' Aufgabe' : ' Aufgaben') + ' für heute angelegt'
                         + (dup ? ', ' + dup + ' gab es schon.' : '.')
                     : 'Nichts angelegt — alles davon steht schon im Journal.';
                 this.selected = [];
@@ -6031,7 +7959,7 @@ const AtlasZettelPage = {
         },
         async remove() {
             if (this.deleting || !this.zettel) return;
-            if (!confirm('Diesen Zettel wirklich löschen? Rückverweise darauf bleiben als Warnung stehen.')) return;
+            if (!confirm('Diese Notiz wirklich löschen? Rückverweise darauf bleiben als Warnung stehen.')) return;
             this.deleting = true;
             try {
                 if (this._save) { clearTimeout(this._save); this._save = null; }
@@ -6089,287 +8017,6 @@ const AtlasZettelPage = {
         if (this._es) { this._es.close(); this._es = null; }
         if (this._search) { clearTimeout(this._search); this._search = null; }
         if (this._save) { clearTimeout(this._save); this._save = null; this.save(); }
-    },
-};
-
-// ── Rückblick (Story 31–34) ─────────────────────────────────────────────────
-// Der Rückblick ist rein abgeleitet: er zählt, was in den Dateien steht, und
-// schreibt selbst nichts — bis auf den einen Knopf, der ihn als Zettel vom Typ
-// Rückblick festhält. Die Wochenleiste oben vergleicht die letzten Wochen.
-const AtlasReviewPage = {
-    components: { 'atlas-nav': AtlasNav, 'atlas-capture': AtlasCapture },
-    template: `
-        <div class="p-6 atlas-page">
-            <atlas-nav active="rueckblick" />
-
-            <div class="atlas-head">
-                <div>
-                    <div class="atlas-kicker">{{ range || 'Rückblick' }}</div>
-                    <h1 class="atlas-title">Rückblick KW {{ week ? week.number : '' }}</h1>
-                </div>
-                <div class="atlas-actions">
-                    <router-link v-if="week" :to="'/atlas/rueckblick/' + week.previous" class="atlas-pill">← KW {{ weekNumberOf(week.previous) }}</router-link>
-                    <router-link v-if="week" :to="'/atlas/rueckblick/' + week.next" class="atlas-pill">KW {{ weekNumberOf(week.next) }} →</router-link>
-                    <span class="atlas-sep"></span>
-                    <router-link v-if="week" :to="'/atlas/woche/' + week.week" class="atlas-pill">Zur Woche</router-link>
-                    <button type="button" class="atlas-pill is-strong" :disabled="busy || !week" @click="keepAsZettel">
-                        {{ busy ? 'Legt an…' : 'Als Zettel festhalten' }}
-                    </button>
-                </div>
-            </div>
-
-            <atlas-capture @created="onCaptured" />
-
-            <!-- Wochenleiste: erledigt/gesamt je Woche, zum Vergleichen -->
-            <section class="atlas-weekstrip" aria-label="Wochen vergleichen">
-                <template v-if="!strip.length">
-                    <div v-for="n in 6" :key="n" class="atlas-skel" style="height:56px; flex:1 1 96px; min-width:96px"></div>
-                </template>
-                <router-link v-for="w in strip" :key="w.week" class="atlas-weekstrip-item"
-                             :class="{ 'is-active': week && w.week === week.week }"
-                             :to="'/atlas/rueckblick/' + w.week">
-                    <span class="atlas-weekstrip-kw">KW {{ weekNumberOf(w.week) }}</span>
-                    <span class="atlas-bar"><span class="atlas-bar-fill" :style="{ width: w.percent }"></span></span>
-                    <span class="atlas-weekstrip-n">{{ w.done }}/{{ w.total }}</span>
-                </router-link>
-            </section>
-
-            <div v-if="loading" class="flex flex-col gap-4">
-                <div class="atlas-skel" style="height:92px"></div>
-                <div class="atlas-skel" style="height:220px"></div>
-            </div>
-
-            <template v-else>
-                <section class="atlas-metrics" aria-label="Kennzahlen der Woche">
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n">{{ review.tasks.done }}<span class="atlas-metric-of">/{{ review.tasks.total }}</span></div>
-                        <div class="atlas-metric-l">Tasks erledigt</div>
-                    </div>
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n" :class="{ 'is-warn': review.tasks.open }">{{ review.tasks.open }}</div>
-                        <div class="atlas-metric-l">offen geblieben</div>
-                    </div>
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n">{{ review.tasks.moved }}</div>
-                        <div class="atlas-metric-l">übertragen</div>
-                    </div>
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n">{{ review.goals.reached }}<span class="atlas-metric-of">/{{ review.goals.total }}</span></div>
-                        <div class="atlas-metric-l">Wochenziele erreicht</div>
-                    </div>
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n">{{ review.zettel.length }}</div>
-                        <div class="atlas-metric-l">Zettel geschrieben</div>
-                    </div>
-                    <div class="atlas-metric">
-                        <div class="atlas-metric-n">{{ review.chapters.length }}</div>
-                        <div class="atlas-metric-l">Kapitel bearbeitet</div>
-                    </div>
-                </section>
-
-                <p v-if="empty" class="atlas-card atlas-empty">
-                    In dieser Woche steht nichts im Journal. Der Rückblick zählt nur, was in den Dateien steht —
-                    er erfindet nichts.
-                </p>
-
-                <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-                    <div class="flex flex-col gap-5 min-w-0">
-                        <section class="atlas-sec">
-                            <div class="atlas-sec-head">
-                                <h2 class="atlas-sec-title">Wochenziele</h2>
-                                <router-link v-if="week" :to="'/atlas/woche/' + week.week" class="atlas-link-btn" style="text-decoration:none">bearbeiten</router-link>
-                            </div>
-                            <div class="atlas-card">
-                                <p v-if="!review.goals.items.length" class="atlas-empty">Diese Woche hatte kein Ziel.</p>
-                                <div v-for="g in review.goals.items" :key="g.index" class="atlas-goal-row"
-                                     :class="{ 'is-reached': g.reached }">
-                                    <span class="atlas-goal-mark">{{ g.reached ? '✓' : '○' }}</span>
-                                    <span class="atlas-goal-row-title">{{ g.title }}</span>
-                                    <span class="atlas-goal-count" :class="{ 'is-done': g.reached }">
-                                        {{ g.total ? g.done_count + '/' + g.total : (g.done ? 'erledigt' : 'offen') }}
-                                    </span>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="atlas-sec">
-                            <div class="atlas-sec-head">
-                                <h2 class="atlas-sec-title">Mehrfach übertragen</h2>
-                                <span class="atlas-sec-note">was liegen bleibt</span>
-                            </div>
-                            <div class="atlas-card">
-                                <p v-if="!review.carried.length" class="atlas-empty">
-                                    Nichts wurde mehr als einmal verschoben. Gute Woche.
-                                </p>
-                                <div v-for="c in review.carried" :key="c.text" class="atlas-carried">
-                                    <span class="atlas-carried-n" :title="c.moves + '× übertragen'">{{ c.moves }}×</span>
-                                    <span class="atlas-carried-text" :class="{ 'is-done': c.done }">{{ c.text }}</span>
-                                    <span class="atlas-task-note">{{ carriedDays(c) }}</span>
-                                </div>
-                            </div>
-                        </section>
-                    </div>
-
-                    <div class="flex flex-col gap-5 min-w-0">
-                        <section class="atlas-sec">
-                            <div class="atlas-sec-head">
-                                <h2 class="atlas-sec-title">Zettel dieser Woche</h2>
-                                <router-link to="/atlas/zettel" class="atlas-link-btn" style="text-decoration:none">alle</router-link>
-                            </div>
-                            <div class="atlas-card">
-                                <p v-if="!review.zettel.length" class="atlas-empty">Kein Zettel mit einem Datum in dieser Woche.</p>
-                                <router-link v-for="z in review.zettel" :key="z.id" class="atlas-list-row"
-                                             :to="'/atlas/zettel/' + encodeURIComponent(z.id)">
-                                    <div class="atlas-list-top">
-                                        <span class="atlas-list-title">{{ z.title || z.id }}</span>
-                                        <span class="atlas-list-date">{{ shortDate(z.date) }}</span>
-                                    </div>
-                                    <div class="atlas-list-sub">{{ typeLabel(z.type) }}</div>
-                                </router-link>
-                            </div>
-                        </section>
-
-                        <section class="atlas-sec">
-                            <h2 class="atlas-sec-title">Bearbeitete Kapitel</h2>
-                            <div class="atlas-card">
-                                <p v-if="!review.chapters.length" class="atlas-empty">In dieser Woche wurde kein Kapitel angefasst.</p>
-                                <router-link v-for="c in review.chapters" :key="c.id" class="atlas-list-row"
-                                             :to="{ path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } }">
-                                    <div class="atlas-list-top">
-                                        <span class="atlas-list-title">{{ c.title || c.id }}</span>
-                                        <span class="atlas-list-date">{{ shortDate(c.modified_at) }}</span>
-                                    </div>
-                                </router-link>
-                            </div>
-                        </section>
-                    </div>
-                </div>
-            </template>
-        </div>
-    `,
-    data() {
-        return { week: null, loading: true, busy: false, strip: [], _stripFor: '', _es: null, _timer: null };
-    },
-    computed: {
-        review() {
-            const r = (this.week && this.week.review) || {};
-            return {
-                tasks: r.tasks || { total: 0, done: 0, open: 0, moved: 0 },
-                zettel: r.zettel || [],
-                goals: r.goals || { total: 0, reached: 0, items: [] },
-                chapters: r.chapters || [],
-                carried: r.carried || [],
-            };
-        },
-        empty() {
-            return !this.review.tasks.total && !this.review.zettel.length
-                && !this.review.goals.total && !this.review.chapters.length;
-        },
-        range() {
-            const days = (this.week && this.week.days) || [];
-            if (days.length < 7) return '';
-            const a = atlasDate(days[0].date);
-            const b = atlasDate(days[6].date);
-            if (!a || !b) return '';
-            return a.getDate() + '. – ' + b.toLocaleDateString('de-DE', { day: 'numeric', month: 'long', year: 'numeric' });
-        },
-    },
-    methods: {
-        shortDate(iso) { return atlasShortDate(iso); },
-        typeLabel(type) { return ATLAS_ZETTEL_TYPES[type] || type || 'Flüchtig'; },
-        weekNumberOf(week) { return atlasWeekNumber(week); },
-        carriedDays(c) {
-            const days = c.days || [];
-            if (!days.length) return '';
-            return atlasShortDate(days[0]) + ' → ' + atlasShortDate(days[days.length - 1]);
-        },
-        async load(silent = false) {
-            if (!silent) this.loading = true;
-            let id = this.$route.params.week;
-            if (!id) {
-                if (!atlasWork.week) await atlasRefreshToday();
-                id = atlasWork.week;
-            }
-            if (!id) { this.loading = false; return; }
-            try {
-                this.week = await api('/api/plugins/atlas/journal/' + encodeURIComponent(id));
-            } catch (e) {
-                if (!silent) alert(atlasErrorText(e));
-            }
-            this.loading = false;
-            this.loadStrip();
-        },
-        // Die sechs Wochen bis einschließlich dieser. Die IDs rechnet die SPA
-        // selbst aus (dieselbe ISO-Regel wie der Server), die Zahlen holt sie
-        // parallel — sechs kleine Anfragen, keine Kette.
-        async loadStrip() {
-            const days = (this.week && this.week.days) || [];
-            if (!days.length) { this.strip = []; return; }
-            const anchor = atlasDate(days[0].date);
-            if (!anchor) { this.strip = []; return; }
-            // Ein Ereignis in derselben Woche ändert nur die eigene Säule —
-            // dafür sechs Wochen neu zu holen wäre Verschwendung.
-            if (this._stripFor === this.week.week && this.strip.length) {
-                this.strip = this.strip.map((w) =>
-                    (w.week === this.week.week ? this.stripRow(w.week, this.week) : w));
-                return;
-            }
-            this._stripFor = this.week.week;
-            const ids = [];
-            for (let k = 5; k >= 0; k--) {
-                const d = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - 7 * k);
-                ids.push(atlasWeekIdOf(d));
-            }
-            const rows = await Promise.all(ids.map(async (id) => {
-                if (this.week && id === this.week.week) return this.stripRow(id, this.week);
-                try {
-                    return this.stripRow(id, await api('/api/plugins/atlas/journal/' + encodeURIComponent(id)));
-                } catch (e) {
-                    return { week: id, done: 0, total: 0, percent: '0%' };
-                }
-            }));
-            this.strip = rows;
-        },
-        stripRow(id, payload) {
-            const t = (payload && payload.review && payload.review.tasks) || { done: 0, total: 0 };
-            return {
-                week: id,
-                done: t.done || 0,
-                total: t.total || 0,
-                percent: t.total ? Math.round((t.done / t.total) * 100) + '%' : '0%',
-            };
-        },
-        scheduleReload() {
-            if (this._timer) clearTimeout(this._timer);
-            this._timer = setTimeout(() => { this._timer = null; this.load(true); }, 200);
-        },
-        async keepAsZettel() {
-            if (this.busy || !this.week) return;
-            this.busy = true;
-            try {
-                const created = await api('/api/plugins/atlas/journal/' + encodeURIComponent(this.week.week) + '/review/zettel',
-                    { method: 'POST' });
-                await atlasLoadEntities(true);
-                if (created && created.id) this.$router.push('/atlas/zettel/' + encodeURIComponent(created.id));
-            } catch (e) {
-                alert(atlasErrorText(e));
-            }
-            this.busy = false;
-        },
-        onCaptured() { this.load(true); },
-    },
-    watch: { '$route.params.week'() { this.load(); } },
-    mounted() {
-        atlasLoadEntities();
-        if (!atlasWork.week) atlasRefreshToday();
-        this.load();
-        this._es = atlasConnectEvents((kind) => {
-            if (!kind || kind === 'journal' || kind === 'zettel') this.scheduleReload();
-        });
-    },
-    beforeUnmount() {
-        if (this._es) { this._es.close(); this._es = null; }
-        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     },
 };
 
@@ -6472,7 +8119,7 @@ const AtlasItemDetailAside = {
             this.$router.push({ path: '/atlas/sammlung', query: { tab: 'ideen', idea: id } });
         },
         openPublication(id) {
-            this.$router.push({ path: '/atlas/sammlung', query: { tab: 'veroeffentlichungen', pub: id } });
+            this.$router.push(atlasPublicationRoute(id));
         },
         openProject(id) {
             this.$router.push({ path: '/atlas/sammlung', query: { tab: 'projekte', proj: id } });
@@ -6480,7 +8127,7 @@ const AtlasItemDetailAside = {
         openZettel(id) {
             this.$router.push('/atlas/zettel/' + encodeURIComponent(id));
         },
-        zettelTypeLabel(v) { return ATLAS_ZETTEL_TYPES[v] || v || 'Flüchtig'; },
+        zettelTypeLabel(v) { return ATLAS_ZETTEL_TYPES[v || 'fleeting'] || v; },
         ideaTypeLabel(v) { return (ATLAS_TYPES.find((x) => x.key === v) || {}).label || v; },
         pubStatusLabel(s) { return (PUBLICATION_STATUSES.find((x) => x.key === s) || {}).label || s; },
         projStatusLabel(s) { return (PROJECT_STATUSES.find((x) => x.key === s) || {}).label || s; },
@@ -6552,7 +8199,7 @@ const AtlasItemDetailAside = {
 
             <!-- Zettel mit diesem Cite Key in refs (#180, Story 38) -->
             <template v-if="zettelLinks.length">
-                <h5 class="lb-aside-h mt-3">Zettel zu diesem Paper</h5>
+                <h5 class="lb-aside-h mt-3">Atlas-Notizen zu diesem Paper</h5>
                 <div class="space-y-1.5">
                     <button v-for="z in zettelLinks" :key="z.id" @click="openZettel(z.id)"
                             class="atlas-aside-link w-full text-left p-2 rounded-lg">
@@ -6675,20 +8322,50 @@ const AtlasResearchChatContext = {
 };
 
 // Einstellungen → Add-ons: der Atlas-Ordner (Einstellung `base_dir` aus
-// plugin.json). Ein/Aus schaltet der Kern in derselben Karte.
+// plugin.json) mit eigenem Hinweis, darunter jedes weitere Feld des
+// Manifests generisch (Text bzw. Schalter, Beschriftung aus dem Katalog) —
+// so steht „Dein Name" (#228) hier, ohne dass das Formular ihn kennt.
+// Ein/Aus schaltet der Kern in derselben Karte.
+const ATLAS_SETTING_HINTS = {
+    own_name: { placeholder: 'z. B. Mustermann, T.', help: 'So, wie dein Name in deinen Papern steht – die Publikationsliste setzt ihn fett.' },
+};
+
+function atlasSettingDrafts(fields, values) {
+    const drafts = {};
+    for (const f of fields || []) {
+        if (f.key === 'base_dir' || f.type === 'secret') continue;
+        const v = (values || {})[f.key];
+        drafts[f.key] = f.type === 'bool' ? (v === true || v === 'true') : (v == null ? '' : String(v));
+    }
+    return drafts;
+}
+
 const AtlasSettings = {
     props: ['addonId', 'fields', 'values', 'save'],
     data() {
-        return { baseDir: (this.values && this.values.base_dir) || '', saving: false, saved: false, error: '' };
+        return {
+            baseDir: (this.values && this.values.base_dir) || '',
+            drafts: atlasSettingDrafts(this.fields, this.values),
+            saving: false, saved: false, error: '',
+        };
+    },
+    computed: {
+        extraFields() { return (this.fields || []).filter((f) => f.key in this.drafts); },
     },
     methods: {
+        label(f) {
+            const text = f.label ? LB.t(f.label) : '';
+            return text && !text.startsWith('⟦') ? text : f.key;
+        },
+        hint(f, what) { return (ATLAS_SETTING_HINTS[f.key] || {})[what] || ''; },
         async submit() {
             this.saving = true;
             this.saved = false;
             this.error = '';
             try {
-                const next = await this.save({ base_dir: this.baseDir });
+                const next = await this.save({ base_dir: this.baseDir, ...this.drafts });
                 this.baseDir = (next && next.base_dir) || '';
+                this.drafts = atlasSettingDrafts(this.fields, next);
                 this.saved = true;
             } catch (e) {
                 this.error = e.message;
@@ -6703,6 +8380,18 @@ const AtlasSettings = {
             <input id="atlas-settings-base-dir" data-field="base_dir" v-model="baseDir" type="text" autocomplete="off"
                    placeholder="Standard: <Basisordner>/atlas"
                    class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+            <div v-for="f in extraFields" :key="f.key" class="space-y-1 pt-2">
+                <label v-if="f.type === 'bool'" class="inline-flex items-center gap-2 text-sm text-gray-700">
+                    <input type="checkbox" v-model="drafts[f.key]" :data-field="f.key" />{{ label(f) }}
+                </label>
+                <template v-else>
+                    <label class="block text-sm font-medium text-gray-700" :for="'atlas-settings-' + f.key">{{ label(f) }}</label>
+                    <input :id="'atlas-settings-' + f.key" :data-field="f.key" v-model="drafts[f.key]" type="text" autocomplete="off"
+                           :placeholder="hint(f, 'placeholder')"
+                           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+                    <p v-if="hint(f, 'help')" class="text-xs text-gray-500">{{ hint(f, 'help') }}</p>
+                </template>
+            </div>
             <div class="flex items-center gap-3">
                 <button type="submit" :disabled="saving" data-testid="atlas-settings-save"
                         class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 hover:bg-gray-50">Speichern</button>
@@ -6711,6 +8400,1434 @@ const AtlasSettings = {
             </div>
         </form>
     `,
+};
+
+// ── Detailseite einer Veröffentlichung (#225 Kopf und Stand, #226) ─────────
+// Eigene Adresse /atlas/veroeffentlichungen/:id statt des Drawers: Dateien
+// ablegen (Explorer-Drag & Drop auf die Seite oder Auswahl), LaTeX-Text
+// einfügen mit sofortiger Zitat-Prüfung, Literatur-Abgleich Manuskript ×
+// Sammlung × Bibliothek, jedes Paper per DOI im Netz oder in LocalBib öffnen.
+// Atlas fügt dabei nie selbst etwas zu Bibliothek oder Sammlung hinzu: was
+// fehlt, steht als Liste da. Ein alter Tiefenlink auf eine virtuelle
+// Sammlungs-ID ohne Datei zeigt, dass diese Sammlung (noch) keine
+// Veröffentlichung ist (ADR-0025).
+
+// Wie viele Dateien liegen im Dokumentordner? null, wenn unbekannt.
+async function atlasDocumentCount(url) {
+    try {
+        return ((await api(url)).documents || []).length;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Der Satz der Lösch-Rückfrage über den Dokumentordner: nur, wenn Dateien
+// darin liegen (ein leerer Ordner geht ohne Spur), unbestimmt, wenn die
+// Zahl nicht bekannt ist.
+function atlasDocumentsKeptNote(count, folder) {
+    if (count === 0) return '';
+    const where = ' – unter „' + folder + '.geloescht-<Datum>“.';
+    if (count === 1) return ' Die Datei im Dokumentordner bleibt erhalten' + where;
+    if (count > 1) return ' Die ' + count + ' Dateien im Dokumentordner bleiben erhalten' + where;
+    return ' Dateien im Dokumentordner bleiben erhalten' + where;
+}
+
+// Ein verknüpftes Manuskript, das der Literatur-Abgleich nicht lesen konnte
+// (`problem` aus GET /publications/{id}/literature) — die übrigen zählen.
+const ATLAS_MANUSCRIPT_PROBLEM = {
+    name_invalid: 'Ungültiger Manuskriptname – Verknüpfung prüfen',
+    not_utf8: 'Manuskript ist nicht UTF-8 – Zitate nicht gelesen',
+    unreadable: 'Manuskript nicht lesbar (gesperrt?)',
+};
+
+const ATLAS_FILE_KIND = {
+    tex: 'LaTeX', bib: 'BibTeX', pdf: 'PDF', png: 'Abbildung', jpg: 'Abbildung', jpeg: 'Abbildung',
+    svg: 'Abbildung', eps: 'Abbildung', gif: 'Abbildung', cls: 'Vorlage', sty: 'Vorlage', bst: 'Vorlage',
+    docx: 'Word', doc: 'Word',
+};
+
+function atlasFileKind(name) {
+    const ext = (String(name).split('.').pop() || '').toLowerCase();
+    return ATLAS_FILE_KIND[ext] || 'Datei';
+}
+
+// "https://doi.org/10.…", "doi:10.…", " 10.… " → "10.…"
+function atlasBareDoi(doi) {
+    return String(doi || '').trim().replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:\s*)/i, '').trim();
+}
+
+function atlasDoiUrl(doi) {
+    return 'https://doi.org/' + atlasBareDoi(doi);
+}
+
+// „Im Netz": die DOI, ohne DOI eine Websuche nach dem Titel.
+function atlasWebUrl(row) {
+    if (row.doi) return atlasDoiUrl(row.doi);
+    return 'https://scholar.google.com/scholar?q=' + encodeURIComponent(row.title || row.key);
+}
+
+// Öffnet jede Adresse in einem eigenen Tab. Gibt der Browser für einen Tab
+// nichts zurück (Pop-up-Blocker), sagt Atlas, wie man Pop-ups erlaubt.
+// Bewusst OHNE das Feature `noopener`: damit liefert window.open laut
+// HTML-Spezifikation immer null, ein geöffneter Tab sähe aus wie ein
+// blockierter. Die Verbindung zum Opener trennt Atlas selbst.
+function atlasOpenTabs(urls) {
+    let blocked = 0;
+    for (const url of urls) {
+        let win = null;
+        try { win = window.open(url, '_blank'); } catch (e) { win = null; }
+        if (win) { try { win.opener = null; } catch (e) { /* ignore */ } }
+        else blocked += 1;
+    }
+    if (blocked) {
+        atlasToast('Dein Browser hat ' + blocked + (blocked === 1 ? ' Tab' : ' Tabs')
+            + ' zurückgehalten. Klick oben rechts in der Adressleiste auf das Symbol und erlaube Pop-ups für LocalBib.',
+            { timeout: 16000 });
+    }
+    return blocked;
+}
+
+function atlasBibEscape(value) {
+    return String(value || '').replace(/[{}]/g, '');
+}
+
+// Die fehlenden Paper als .bib — aus dem, was die Literatur-Zeilen wissen
+// (Titel/Autor:innen/Jahr/DOI aus einer .bib des Dokumentordners).
+function atlasBibFor(rows) {
+    return rows.map((r) => {
+        const fields = [];
+        if (r.title) fields.push('  title = {' + atlasBibEscape(r.title) + '}');
+        if (r.authors) fields.push('  author = {' + atlasBibEscape(r.authors) + '}');
+        if (r.year) fields.push('  year = {' + atlasBibEscape(r.year) + '}');
+        if (r.doi) fields.push('  doi = {' + atlasBibEscape(r.doi) + '}');
+        return '@misc{' + r.key + (fields.length ? ',\n' + fields.join(',\n') + '\n' : ',\n') + '}';
+    }).join('\n\n') + '\n';
+}
+
+function atlasDownload(filename, text, type = 'text/plain') {
+    try {
+        const blob = new Blob([text], { type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function atlasCopy(text) {
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (e) { /* fällt auf den Hinweis zurück */ }
+    return false;
+}
+
+// „Angaben bearbeiten": ein schlankes Formular statt Komma-Listen —
+// Manuskripte, Projekte, Ideen und das eigene Paper per Auswahl/Suche. Der
+// Schreibpfad bleibt das partielle Update der Veröffentlichung.
+const AtlasPublicationEdit = {
+    components: { 'atlas-icon': AtlasIcon, 'atlas-chips': AtlasChips },
+    props: { pub: { type: Object, required: true } },
+    emits: ['close', 'saved'],
+    template: `
+        <div class="atlas-modal-backdrop" @click.self="$emit('close')" @keydown.esc="$emit('close')">
+            <form class="atlas-modal" role="dialog" aria-modal="true" aria-labelledby="atlas-pubedit-h" @submit.prevent="save">
+                <div class="atlas-new-head">
+                    <div>
+                        <h2 id="atlas-pubedit-h" class="atlas-modal-title">Angaben bearbeiten</h2>
+                        <p class="atlas-modal-sub">Verknüpfungen wählst du aus – Komma-Listen braucht es nicht.</p>
+                    </div>
+                    <button type="button" class="atlas-icon-square" aria-label="Schließen" @click="$emit('close')"><atlas-icon name="close" /></button>
+                </div>
+                <div class="atlas-new-form">
+                    <div class="atlas-new-field">
+                        <label for="atlas-pe-title" class="atlas-new-legend">Titel</label>
+                        <input id="atlas-pe-title" v-model="draft.title" class="atlas-input" :disabled="!!pub.collection" />
+                        <span v-if="pub.collection" class="atlas-new-help">Der Titel ist der Name der Sammlung – in LocalBib umbenennen.</span>
+                    </div>
+                    <div class="atlas-form-grid">
+                        <div class="atlas-new-field">
+                            <label for="atlas-pe-type" class="atlas-new-legend">Art</label>
+                            <select id="atlas-pe-type" v-model="draft.type" class="atlas-input">
+                                <option value="">—</option>
+                                <option v-for="(label, key) in types" :key="key" :value="key">{{ label }}</option>
+                            </select>
+                        </div>
+                        <div class="atlas-new-field">
+                            <label for="atlas-pe-venue" class="atlas-new-legend">Venue</label>
+                            <input id="atlas-pe-venue" v-model="draft.venue" class="atlas-input" placeholder="Journal, Konferenz, Verlag" />
+                        </div>
+                        <div class="atlas-new-field">
+                            <label for="atlas-pe-due" class="atlas-new-legend">Frist</label>
+                            <input id="atlas-pe-due" v-model="draft.due" type="date" class="atlas-input" />
+                        </div>
+                    </div>
+                    <div class="atlas-new-field">
+                        <span class="atlas-new-legend">Co-Autor:innen</span>
+                        <atlas-chips v-model="draft.authors" label="Co-Autor:innen" placeholder="Name, Enter" />
+                    </div>
+                    <div v-for="group in pickers" :key="group.field" class="atlas-new-field">
+                        <span class="atlas-new-legend">{{ group.label }}</span>
+                        <div class="atlas-link-box">
+                            <span v-for="id in draft[group.field]" :key="id" class="atlas-chip">
+                                <span class="atlas-chip-label">{{ group.title(id) }}</span>
+                                <button type="button" class="atlas-chip-x" :aria-label="group.label + ': ' + group.title(id) + ' entfernen'" @click="remove(group.field, id)">×</button>
+                            </span>
+                            <select class="atlas-link-input" :aria-label="group.label + ' hinzufügen'" @change="add(group.field, $event)">
+                                <option value="">+ hinzufügen …</option>
+                                <option v-for="o in group.options()" :key="o.id" :value="o.id">{{ o.title }}</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="atlas-new-field">
+                        <label for="atlas-pe-paper" class="atlas-new-legend">Eigenes Paper <span class="atlas-muted">(aus deiner Bibliothek)</span></label>
+                        <div class="atlas-link-box">
+                            <span v-if="draft.paper" class="atlas-chip">
+                                <span class="atlas-chip-kind">Bibliothek</span><span class="atlas-chip-label">{{ paperTitle }}</span>
+                                <button type="button" class="atlas-chip-x" aria-label="Eigenes Paper entfernen" @click="draft.paper = ''">×</button>
+                            </span>
+                            <input v-else id="atlas-pe-paper" v-model="paperQuery" class="atlas-link-input" placeholder="Titel, Autor:in oder DOI suchen …" autocomplete="off" @focus="loadPapers" />
+                        </div>
+                        <div v-if="!draft.paper && paperQuery.trim()" class="atlas-sug is-inline" role="listbox" aria-label="Paper der Bibliothek">
+                            <button v-for="p in paperHits" :key="p.id" type="button" role="option" class="atlas-sug-item" @click="pickPaper(p)">
+                                <span class="atlas-sug-title">{{ p.title }}</span><span class="atlas-sug-id">{{ p.year || '' }}</span>
+                            </button>
+                            <div v-if="papersLoading && !paperHits.length" class="atlas-sug-empty">Lädt die Bibliothek …</div>
+                            <div v-else-if="papersFailed" class="atlas-sug-empty">Die Bibliothek ließ sich nicht laden. Klick noch einmal ins Feld, um es erneut zu versuchen.</div>
+                            <div v-else-if="!paperHits.length" class="atlas-sug-empty">Nicht in der Bibliothek. Importiere es zuerst in LocalBib.</div>
+                        </div>
+                    </div>
+                    <p v-if="error" class="atlas-error" role="alert">{{ error }}</p>
+                </div>
+                <div class="atlas-new-foot">
+                    <router-link :to="legacyRoute" class="atlas-more" @click="$emit('close')">Alle Felder (bisheriges Formular)</router-link>
+                    <div class="atlas-row-gap">
+                        <button type="button" class="atlas-btn" @click="$emit('close')">Abbrechen</button>
+                        <button type="submit" class="atlas-btn is-primary" :disabled="busy">{{ busy ? 'Speichert…' : 'Speichern' }}</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    `,
+    data() {
+        const p = this.pub;
+        return {
+            draft: {
+                title: p.title || '',
+                type: p.type || '',
+                venue: p.venue || '',
+                due: p.due || '',
+                authors: [...(p.authors || [])],
+                manuscripts: [...(p.manuscripts || [])],
+                projects: [...(p.projects || [])],
+                derived_from: [...(p.derived_from || [])],
+                paper: p.paper || '',
+            },
+            manuscripts: [],
+            // Die Bibliothek für „Eigenes Paper": erst beim ersten Fokus des
+            // Suchfelds geladen (nicht beim Öffnen), dann für die Lebenszeit
+            // des Dialogs behalten. Der Vertrag (plugin_api) kennt keine
+            // schlanke Liste, und die Kernsuche `?search=` findet weder DOIs
+            // noch Umlaute ohne Rücksicht auf Groß/klein — also hier filtern.
+            papers: [],
+            papersLoad: null,
+            papersLoading: false,
+            papersFailed: false,
+            paperQuery: '',
+            paperPicked: null,
+            busy: false,
+            error: '',
+        };
+    },
+    watch: {
+        // Erstes Laden auch ohne Fokus (Einfügen) — ein gescheitertes Laden
+        // versucht aber nur der nächste Fokus erneut, nie jeder Tastendruck.
+        paperQuery(q) { if (q.trim() && !this.papersFailed) this.loadPapers(); },
+    },
+    computed: {
+        types() { return ATLAS_PUBLICATION_TYPE_LABEL; },
+        legacyRoute() { return atlasPublicationLegacyRoute(this.pub.id); },
+        pickers() {
+            const entityTitle = (id) => { const e = atlasEntity(id); return (e && e.title) || id; };
+            const entities = (kind, field) => () => atlasWork.entities
+                .filter((e) => e.kind === kind && !this.draft[field].includes(e.id))
+                .map((e) => ({ id: e.id, title: e.title || e.id }));
+            return [
+                {
+                    field: 'manuscripts', label: 'Manuskripte',
+                    title: (id) => id,
+                    options: () => this.manuscripts
+                        .map((m) => m.id + '.tex')
+                        .filter((name) => !this.draft.manuscripts.includes(name))
+                        .map((name) => ({ id: name, title: name })),
+                },
+                { field: 'projects', label: 'Projekte', title: entityTitle, options: entities('project', 'projects') },
+                { field: 'derived_from', label: 'Ideen', title: entityTitle, options: entities('idea', 'derived_from') },
+            ];
+        },
+        // Titel, Autor:innen oder DOI, ohne Rücksicht auf Groß/klein (auch
+        // Umlaute); nur Items mit Cite Key — verknüpft wird per Cite Key.
+        paperHits() {
+            const q = this.paperQuery.trim().toLowerCase();
+            if (!q) return [];
+            const has = (value) => String(value || '').toLowerCase().includes(q);
+            return this.papers
+                .filter((p) => p.cite_key && (has(p.title) || has(p.authors) || has(p.doi)))
+                .slice(0, 8);
+        },
+        paperTitle() {
+            const picked = this.paperPicked;
+            if (picked && picked.cite_key === this.draft.paper) return picked.title || this.draft.paper;
+            const hit = this.papers.find((p) => p.cite_key && p.cite_key === this.draft.paper);
+            if (hit) return hit.title || this.draft.paper;
+            const resolved = this.pub.paper_resolved;
+            if (resolved && resolved.found && resolved.citekey === this.draft.paper) return resolved.title || this.draft.paper;
+            return this.draft.paper;
+        },
+    },
+    methods: {
+        add(field, event) {
+            const id = event.target.value;
+            event.target.value = '';
+            if (id && !this.draft[field].includes(id)) this.draft[field].push(id);
+        },
+        remove(field, id) { this.draft[field] = this.draft[field].filter((x) => x !== id); },
+        pickPaper(p) {
+            this.draft.paper = p.cite_key || '';
+            this.paperPicked = { cite_key: p.cite_key || '', title: p.title || '' };
+            this.paperQuery = '';
+        },
+        // Einmal je Dialog; schlägt es fehl, versucht es der nächste Fokus.
+        loadPapers() {
+            if (this.papersLoad) return this.papersLoad;
+            this.papersLoading = true;
+            this.papersFailed = false;
+            this.papersLoad = api('/api/papers')
+                .then((data) => { this.papers = Array.isArray(data) ? data : (data.papers || data.items || []); })
+                .catch(() => { this.papers = []; this.papersLoad = null; this.papersFailed = true; })
+                .finally(() => { this.papersLoading = false; });
+            return this.papersLoad;
+        },
+        async save() {
+            if (this.busy) return;
+            const d = this.draft;
+            const p = this.pub;
+            const body = {};
+            const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+            if (!p.collection && d.title.trim() && d.title.trim() !== p.title) body.title = d.title.trim();
+            if ((d.type || null) !== (p.type || null)) body.type = d.type || null;
+            if ((d.venue.trim() || null) !== (p.venue || null)) body.venue = d.venue.trim() || null;
+            if ((d.due || null) !== (p.due || null)) body.due = d.due || null;
+            if ((d.paper || null) !== (p.paper || null)) body.paper = d.paper || null;
+            for (const field of ['authors', 'manuscripts', 'projects', 'derived_from']) {
+                if (!same(d[field], p[field])) body[field] = d[field];
+            }
+            if (!Object.keys(body).length) { this.$emit('close'); return; }
+            this.busy = true;
+            this.error = '';
+            try {
+                await api('/api/plugins/atlas/publications/' + encodeURIComponent(p.id), {
+                    method: 'PUT', body: JSON.stringify(body),
+                });
+                atlasToast('Angaben gespeichert.');
+                this.$emit('saved');
+            } catch (e) {
+                this.error = atlasErrorText(e);
+            }
+            this.busy = false;
+        },
+    },
+    async mounted() {
+        atlasLoadEntities();
+        try { this.manuscripts = (await api('/api/plugins/atlas/manuscripts')).manuscripts || []; } catch (e) { this.manuscripts = []; }
+    },
+};
+
+const ATLAS_LIT_FILTERS = [
+    { key: 'all', label: 'Alle' },
+    { key: 'missing', label: 'Fehlen in der Bibliothek' },
+    { key: 'uncited', label: 'Noch nicht zitiert' },
+];
+
+const AtlasPublicationPage = {
+    components: {
+        'atlas-nav': AtlasNav,
+        'atlas-icon': AtlasIcon,
+        'atlas-anchor-chip': AtlasAnchorChip,
+        'atlas-publication-edit': AtlasPublicationEdit,
+    },
+    template: `
+        <div class="atlas-page atlas-shell" lang="de" @dragover.stop.prevent="onDragOver" @dragleave="onDragLeave" @drop.stop.prevent="onDrop">
+            <atlas-nav active="veroeffentlichungen" />
+
+            <div v-if="loading" class="atlas-skel" style="height:120px" aria-hidden="true"></div>
+
+            <section v-else-if="missing" class="atlas-panel is-padded atlas-missing" role="status">
+                <router-link :to="backRoute" class="atlas-back"><atlas-icon name="back" :size="16" /> Veröffentlichungen</router-link>
+                <template v-if="virtualId">
+                    <h1 class="atlas-title is-small">Diese Sammlung ist keine Veröffentlichung</h1>
+                    <p class="atlas-muted">Sammlungen sind Ablageorte für Paper. Soll daraus eine Veröffentlichung werden, plan sie über „Aus Sammlung planen“ – ihre Paper sind dann deren Literaturliste.</p>
+                    <router-link :to="planRoute" class="atlas-btn is-primary is-tall" style="align-self:flex-start">
+                        <atlas-icon name="stack" /> Aus Sammlung planen
+                    </router-link>
+                </template>
+                <template v-else>
+                    <h1 class="atlas-title is-small">Diese Veröffentlichung gibt es nicht (mehr)</h1>
+                    <p class="atlas-muted">Vielleicht wurde die Datei umbenannt oder gelöscht.</p>
+                </template>
+            </section>
+
+            <template v-else-if="pub">
+                <header class="atlas-detail-header">
+                    <router-link :to="backRoute" class="atlas-back"><atlas-icon name="back" :size="16" /> Veröffentlichungen</router-link>
+                    <div class="atlas-detail-titlerow">
+                        <div class="atlas-detail-titles">
+                            <h1 class="atlas-title is-detail">{{ pub.title }}</h1>
+                            <div class="atlas-detail-meta">
+                                <template v-for="(m, i) in metaParts" :key="i">
+                                    <span v-if="i" aria-hidden="true" class="atlas-dot">·</span><span>{{ m }}</span>
+                                </template>
+                            </div>
+                        </div>
+                        <div class="atlas-header-actions">
+                            <button type="button" class="atlas-btn is-tall" @click="editOpen = true">Angaben bearbeiten</button>
+                            <router-link v-if="firstManuscript" :to="editorRoute(firstManuscript)" class="atlas-btn is-primary is-tall">
+                                <atlas-icon name="pen" /> LaTeX-Editor öffnen
+                            </router-link>
+                        </div>
+                    </div>
+                    <ol class="atlas-steps" aria-label="Stand der Veröffentlichung">
+                        <li v-for="(st, i) in steps" :key="st.key" class="atlas-step-li">
+                            <atlas-icon v-if="i" name="chevronRight" :size="14" class="atlas-step-sep" />
+                            <button type="button" class="atlas-step" :class="{ 'is-current': st.current, 'is-past': st.past }"
+                                    :aria-pressed="st.current ? 'true' : 'false'" :disabled="busy" @click="setStatus(st.key)">
+                                <atlas-icon v-if="st.past" name="check" :size="14" />{{ st.name }}
+                            </button>
+                        </li>
+                    </ol>
+                    <p v-if="closedLabel" class="atlas-muted">Status: {{ closedLabel }}</p>
+                </header>
+
+                <div class="atlas-columns">
+                    <div class="atlas-col-main">
+                        <!-- Dateien -->
+                        <section class="atlas-panel is-padded atlas-stack" aria-labelledby="atlas-h-files">
+                            <div class="atlas-panel-head is-flush">
+                                <h2 id="atlas-h-files" class="atlas-panel-title">Dateien</h2>
+                                <span class="atlas-panel-note is-inline">liegen im Atlas-Ordner unter <span class="atlas-mono">{{ folder }}</span></span>
+                            </div>
+                            <div class="atlas-dropzone-files" :class="{ 'is-over': dropOver }">
+                                <span class="atlas-dz-icon"><atlas-icon name="upload" :size="22" /></span>
+                                <div class="atlas-dz-text">
+                                    <div class="atlas-dz-title">{{ dropOver ? 'Loslassen zum Hinzufügen' : 'Dateien hierher ziehen' }}</div>
+                                    <div class="atlas-dz-sub">.tex, .bib, PDF, Abbildungen, Vorlagen – oder LaTeX-Text direkt einfügen. Zitate werden sofort mit der Bibliothek abgeglichen.</div>
+                                </div>
+                                <label class="atlas-btn">
+                                    <input ref="fileInput" type="file" multiple class="atlas-sr" @change="onPick" />
+                                    Dateien auswählen
+                                </label>
+                                <button type="button" class="atlas-btn" :aria-expanded="pasteOpen ? 'true' : 'false'" @click="pasteOpen = !pasteOpen">
+                                    <atlas-icon name="paste" :size="16" /> Text einfügen
+                                </button>
+                            </div>
+                            <p v-if="uploading" class="atlas-muted" role="status">Legt ab…</p>
+
+                            <div v-if="pasteOpen" class="atlas-paste">
+                                <label for="atlas-paste-tex" class="atlas-new-legend">LaTeX-Text</label>
+                                <textarea id="atlas-paste-tex" v-model="paste" rows="6" class="atlas-textarea"
+                                          placeholder="Abschnitt aus dem Manuskript hier einfügen (Strg V) – Atlas erkennt \\cite{…} und gleicht mit der Bibliothek ab."
+                                          @input="schedulePasteCheck"></textarea>
+                                <div class="atlas-paste-foot">
+                                    <span class="atlas-paste-summary" :class="pasteTone" role="status">{{ pasteSummary }}</span>
+                                    <button type="button" class="atlas-btn" :disabled="!paste.trim() || savingPaste" @click="savePaste">
+                                        {{ savingPaste ? 'Speichert…' : 'Als .tex speichern' }}
+                                    </button>
+                                </div>
+                            </div>
+
+                            <ul class="atlas-files">
+                                <li v-for="f in files" :key="f.key" class="atlas-file-row">
+                                    <span class="atlas-plan-icon"><atlas-icon :name="f.icon" /></span>
+                                    <div class="atlas-file-text">
+                                        <div class="atlas-file-name-row">
+                                            <span class="atlas-mono atlas-file-name">{{ f.name }}</span>
+                                            <span class="atlas-badge is-small">{{ f.kind }}</span>
+                                            <span v-if="f.fresh" class="atlas-badge is-small is-accent">neu</span>
+                                        </div>
+                                        <div class="atlas-file-note">{{ f.note }}</div>
+                                    </div>
+                                    <router-link v-if="f.route" :to="f.route" class="atlas-text-btn is-link">{{ f.action }}</router-link>
+                                    <button v-else-if="f.open" type="button" class="atlas-text-btn" @click="openDocument(f.name)">{{ f.action }}</button>
+                                    <button v-if="f.removable" type="button" class="atlas-text-btn is-muted"
+                                            :aria-label="f.name + ' entfernen'" @click="removeDocument(f.name)">Entfernen</button>
+                                </li>
+                                <li v-if="!files.length" class="atlas-file-row is-empty">Noch keine Dateien bei diesem Beitrag.</li>
+                            </ul>
+                        </section>
+
+                        <!-- Literatur -->
+                        <section class="atlas-panel is-padded atlas-stack" aria-labelledby="atlas-h-lit">
+                            <div class="atlas-panel-head is-flush">
+                                <h2 id="atlas-h-lit" class="atlas-panel-title">Literatur</h2>
+                                <span class="atlas-panel-note is-inline">{{ counts.total }} Paper aus Manuskript und {{ sourceLabel }}</span>
+                            </div>
+                            <template v-if="counts.total">
+                                <div class="atlas-litbar" role="img" :aria-label="barAria">
+                                    <div class="atlas-litbar-part is-ok" :style="{ width: pct(counts.cited_in_library) }"></div>
+                                    <div class="atlas-litbar-part is-uncited" :style="{ width: pct(counts.uncited) }"></div>
+                                    <div class="atlas-litbar-part is-missing" :style="{ width: pct(counts.cited_missing) }"></div>
+                                </div>
+                                <div class="atlas-legend is-roomy">
+                                    <span><i class="atlas-swatch is-done"></i>zitiert und in der Bibliothek · {{ counts.cited_in_library }}</span>
+                                    <span><i class="atlas-swatch is-open"></i>{{ sourceUncitedLabel }} · {{ counts.uncited }}</span>
+                                    <span><i class="atlas-swatch is-danger"></i>zitiert, fehlt in der Bibliothek · {{ counts.cited_missing }}</span>
+                                </div>
+                            </template>
+                            <p v-else class="atlas-muted">
+                                Noch keine Literatur: verknüpf ein Manuskript mit <code>\\cite{…}</code> oder plan eine Sammlung als Literaturliste.
+                            </p>
+
+                            <div v-if="missingRows.length" class="atlas-missing-box" role="region" aria-label="Fehlende Paper">
+                                <div class="atlas-missing-title"><atlas-icon name="alert" :size="18" />
+                                    {{ missingRows.length }} {{ missingRows.length === 1 ? 'Paper fehlt' : 'Paper fehlen' }} in der Bibliothek</div>
+                                <ul class="atlas-missing-list">
+                                    <li v-for="m in missingRows" :key="m.key">
+                                        <span class="atlas-missing-name">{{ m.title || m.key }}</span>
+                                        <span v-if="who(m)" class="atlas-muted">{{ who(m) }}</span>
+                                        <span class="atlas-mono is-small">{{ m.doi ? 'doi:' + m.doi : 'kein DOI' }}</span>
+                                    </li>
+                                </ul>
+                                <p class="atlas-missing-note">Atlas legt nichts selbst an. Du nimmst die Liste mit in den Import von LocalBib und siehst dort vorher, was dazukommt.</p>
+                                <div class="atlas-row-gap">
+                                    <button type="button" class="atlas-btn is-primary" @click="importMissing"><atlas-icon name="download" :size="16" /> In LocalBib importieren</button>
+                                    <button type="button" class="atlas-btn" @click="copyDois">DOIs kopieren</button>
+                                    <button type="button" class="atlas-btn" @click="downloadBib">Als .bib</button>
+                                    <button type="button" class="atlas-btn" @click="openMissing"><atlas-icon name="external" :size="16" /> Im Netz öffnen</button>
+                                </div>
+                            </div>
+
+                            <div v-if="counts.total" class="atlas-lit-toolbar">
+                                <fieldset class="atlas-chip-row atlas-plain-fieldset">
+                                    <legend class="atlas-sr">Paper filtern</legend>
+                                    <label v-for="f in filters" :key="f.key" class="atlas-choice" :class="{ 'is-on': filter === f.key }">
+                                        <input type="radio" name="atlas-lit-filter" class="atlas-sr" :value="f.key" v-model="filter" />
+                                        {{ f.label }}<span class="atlas-mono-sub">{{ f.count }}</span>
+                                    </label>
+                                </fieldset>
+                                <button type="button" class="atlas-btn is-small" :disabled="!shownRows.length" @click="openAll">
+                                    <atlas-icon name="external" :size="16" /> Alle {{ shownRows.length }} im Netz öffnen
+                                </button>
+                            </div>
+
+                            <div v-if="counts.total" class="atlas-lit-scroll">
+                                <div class="atlas-lit-table">
+                                    <div class="atlas-lit-head" aria-hidden="true">
+                                        <span>Paper</span><span>Manuskript</span><span>Bibliothek</span><span>Öffnen</span>
+                                    </div>
+                                    <ul class="atlas-lit-rows">
+                                        <li v-for="r in shownRows" :key="r.key" class="atlas-lit-row">
+                                            <div class="atlas-lit-paper">
+                                                <button type="button" class="atlas-lit-main" :title="r.in_library ? 'In LocalBib öffnen' : 'Im Netz öffnen'"
+                                                        @click="openMain(r)">{{ r.title || r.key }}</button>
+                                                <div class="atlas-lit-sub"><template v-if="who(r)">{{ who(r) }} · </template><span class="atlas-mono is-small">{{ r.doi ? 'doi:' + r.doi : 'kein DOI' }}</span></div>
+                                            </div>
+                                            <div>
+                                                <span class="atlas-sr">Im Manuskript: </span>
+                                                <span v-if="r.cited" class="atlas-cited"><atlas-icon name="check" :size="15" />zitiert</span>
+                                                <span v-else class="atlas-muted">noch nicht</span>
+                                            </div>
+                                            <div>
+                                                <span class="atlas-sr">Bibliothek: </span>
+                                                <span v-if="r.in_library && r.has_pdf" class="atlas-lib is-pdf"><atlas-icon name="check" :size="14" />mit PDF</span>
+                                                <span v-else-if="r.in_library" class="atlas-lib is-nopdf"><atlas-icon name="doc" :size="14" />ohne PDF</span>
+                                                <span v-else class="atlas-lib is-missing"><atlas-icon name="alert" :size="14" />fehlt</span>
+                                            </div>
+                                            <div class="atlas-lit-open">
+                                                <button v-if="r.in_library" type="button" class="atlas-btn is-mini" :aria-label="'„' + (r.title || r.key) + '“ in LocalBib öffnen'"
+                                                        @click="openLocal(r)"><atlas-icon name="book" :size="14" />LocalBib</button>
+                                                <button type="button" class="atlas-btn is-mini"
+                                                        :aria-label="r.doi ? '„' + (r.title || r.key) + '“ über die DOI im Netz öffnen' : 'Im Netz nach „' + (r.title || r.key) + '“ suchen'"
+                                                        @click="openWeb(r)"><atlas-icon name="external" :size="14" />{{ r.doi ? 'DOI' : 'Suchen' }}</button>
+                                            </div>
+                                        </li>
+                                    </ul>
+                                    <p v-if="!shownRows.length" class="atlas-lit-empty">Hier ist nichts offen.</p>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <aside class="atlas-col-side">
+                        <section v-if="collection" class="atlas-panel is-padded atlas-stack" aria-labelledby="atlas-h-coll">
+                            <h2 id="atlas-h-coll" class="atlas-kicker">Literatur aus der Sammlung</h2>
+                            <div class="atlas-coll-head">
+                                <span class="atlas-plan-icon is-accent is-big"><atlas-icon name="stack" /></span>
+                                <div>
+                                    <div class="atlas-plan-name">{{ collection.name }}</div>
+                                    <div class="atlas-plan-meta">{{ collection.item_count }} Paper · Sammlung in LocalBib<template v-if="collection.archived"> · archiviert</template></div>
+                                </div>
+                            </div>
+                            <ul class="atlas-bullets">
+                                <li><atlas-icon name="check" :size="16" />Was du in LocalBib in die Sammlung legst, steht hier sofort mit.</li>
+                                <li><atlas-icon name="check" :size="16" /><span>Die Bibliographie für LaTeX wird beim Kompilieren daraus erzeugt.</span></li>
+                            </ul>
+                            <div class="atlas-row-gap">
+                                <router-link :to="'/collection/' + collection.id" class="atlas-btn">In LocalBib öffnen</router-link>
+                                <router-link :to="planRoute" class="atlas-btn">Alle Sammlungen</router-link>
+                            </div>
+                        </section>
+                        <section v-else class="atlas-panel is-padded atlas-stack" aria-labelledby="atlas-h-coll">
+                            <h2 id="atlas-h-coll" class="atlas-kicker">Literaturliste</h2>
+                            <p class="atlas-muted" style="margin:0">
+                                <template v-if="(pub.refs || []).length">{{ pub.refs.length }} Cite Keys stehen als feste Liste in der Datei.</template>
+                                <template v-else>Keine Sammlung verknüpft.</template>
+                                Aus einer Sammlung planen macht deren Paper zur Literaturliste, die mitwächst.
+                            </p>
+                            <router-link :to="planRoute" class="atlas-btn" style="align-self:flex-start">Alle Sammlungen</router-link>
+                        </section>
+
+                        <section class="atlas-panel is-padded" aria-labelledby="atlas-h-fristen">
+                            <h2 id="atlas-h-fristen" class="atlas-panel-title is-side">Fristen &amp; Aufgaben</h2>
+                            <ul class="atlas-agenda">
+                                <li v-for="d in dates" :key="d.key" class="atlas-agenda-row">
+                                    <span class="atlas-agenda-icon" :class="d.tone ? 'is-' + d.tone : ''"><atlas-icon :name="d.icon" /></span>
+                                    <div class="atlas-agenda-body">
+                                        <div class="atlas-agenda-title">{{ d.title }}</div>
+                                        <div class="atlas-agenda-sub">{{ d.sub }}</div>
+                                    </div>
+                                </li>
+                                <li v-if="!dates.length" class="atlas-agenda-row atlas-muted">Keine Frist eingetragen.</li>
+                            </ul>
+                            <div class="atlas-group-label">Aufgaben zu diesem Beitrag</div>
+                            <ul class="atlas-mini-tasks">
+                                <li v-for="t in tasks" :key="t.week + '#' + t.body_index" class="atlas-mini-task">
+                                    <input :id="'atlas-pt-' + t.week + t.body_index" type="checkbox" class="atlas-check" :checked="t.done"
+                                           :disabled="!!t.moved_to" @change="toggleTask(t)" />
+                                    <label :for="'atlas-pt-' + t.week + t.body_index" :class="{ 'is-done': t.done }">{{ t.text }}</label>
+                                    <span class="atlas-mini-day" :class="{ 'is-today': t.day === today }">{{ t.day === today ? 'heute' : shortDay(t.day) }}</span>
+                                </li>
+                                <li v-if="!tasks.length" class="atlas-muted atlas-mini-task">Noch keine Aufgabe mit Anker auf diesen Beitrag.</li>
+                            </ul>
+                            <button type="button" class="atlas-col-foot-btn" @click="newTask"><atlas-icon name="plus" :size="16" /> Aufgabe zu diesem Beitrag</button>
+                        </section>
+
+                        <section class="atlas-panel is-padded" aria-labelledby="atlas-h-verk">
+                            <h2 id="atlas-h-verk" class="atlas-panel-title is-side">Gehört zu</h2>
+                            <ul class="atlas-belongs">
+                                <li v-for="b in belongs" :key="b.key">
+                                    <span class="atlas-muted">{{ b.label }}</span>
+                                    <router-link v-if="b.to" :to="b.to" class="atlas-belongs-link">{{ b.title }}</router-link>
+                                    <span v-else class="atlas-belongs-link">{{ b.title }}</span>
+                                </li>
+                                <li v-if="!belongs.length"><span class="atlas-muted">Noch keinem Kapitel, Projekt und keiner Notiz zugeordnet.</span></li>
+                            </ul>
+                        </section>
+                    </aside>
+                </div>
+
+                <atlas-publication-edit v-if="editOpen" :pub="pub" @close="editOpen = false" @saved="onSaved" />
+            </template>
+        </div>
+    `,
+    data() {
+        return {
+            pub: null,
+            loading: true,
+            missing: false,
+            busy: false,
+            literature: null,
+            documents: [],
+            folder: '',
+            tasks: [],
+            chapters: [],
+            backlinks: null,
+            filter: 'all',
+            dropOver: false,
+            uploading: false,
+            fresh: [],
+            pasteOpen: false,
+            paste: '',
+            pasteResult: null,
+            savingPaste: false,
+            editOpen: false,
+            _pasteTimer: null,
+        };
+    },
+    computed: {
+        id() { return String(this.$route.params.id || ''); },
+        // Alter Tiefenlink auf einen früheren virtuellen Eintrag (`sammlung-<id>`,
+        // ohne Datei): erklärt, statt „gibt es nicht" zu sagen (ADR-0025).
+        virtualId() { return /^sammlung-\d+(-\d+)?$/.test(this.id); },
+        today() { return atlasTodayIso(); },
+        backRoute() { return ATLAS_PUBLICATIONS_ROUTE; },
+        planRoute() { return { path: ATLAS_PUBLICATIONS_ROUTE, query: { planen: '1' } }; },
+        collection() {
+            const c = this.pub && this.pub.collection;
+            return c && !c.missing ? c : null;
+        },
+        metaParts() {
+            const p = this.pub;
+            const out = [];
+            if (ATLAS_PUBLICATION_TYPE_LABEL[p.type]) out.push(ATLAS_PUBLICATION_TYPE_LABEL[p.type]);
+            out.push(p.venue || 'Ziel noch offen');
+            if ((p.authors || []).length) out.push('mit ' + p.authors.join(', '));
+            return out;
+        },
+        firstManuscript() {
+            const m = ((this.pub && this.pub.manuscripts) || [])[0];
+            return m ? m.replace(/\.tex$/i, '') : null;
+        },
+        steps() {
+            const order = ATLAS_PIPELINE.map((s) => s.key);
+            const idx = order.indexOf(this.pub.status);
+            return ATLAS_PIPELINE.map((s, i) => ({
+                key: s.key, name: s.name, current: i === idx, past: idx >= 0 && i < idx,
+            }));
+        },
+        closedLabel() {
+            return ATLAS_PIPELINE_CLOSED.has(this.pub && this.pub.status)
+                ? ATLAS_PUBLICATION_STATUS_LABEL[this.pub.status] : '';
+        },
+        // Dateiliste: verknüpfte Manuskripte, die Bibliographie (aus der
+        // Sammlung erzeugt, keine Datei) und der Dokumentordner.
+        files() {
+            const out = [];
+            const lit = this.literature;
+            const cites = {};
+            for (const m of (lit && lit.manuscripts) || []) cites[m.id] = m;
+            for (const name of (this.pub && this.pub.manuscripts) || []) {
+                const id = name.replace(/\.tex$/i, '');
+                const info = cites[id];
+                const file = /\.tex$/i.test(name) ? name : name + '.tex';
+                out.push({
+                    key: 'ms:' + id, name: file, kind: 'LaTeX', icon: 'doc',
+                    note: info && info.problem ? (ATLAS_MANUSCRIPT_PROBLEM[info.problem] || 'Manuskript nicht lesbar')
+                        : info && !info.found ? 'Manuskript fehlt in manuskripte/'
+                        : 'Manuskript' + (info ? ' · ' + info.cite_count + (info.cite_count === 1 ? ' Zitat' : ' Zitate') : ''),
+                    action: 'Im Editor öffnen', route: atlasEditorRoute(id),
+                    fresh: this.fresh.includes(file),
+                });
+            }
+            if (this.collection) {
+                out.push({
+                    key: 'bib', name: 'Bibliographie (.bib)', kind: 'BibTeX', icon: 'stack',
+                    note: 'aus der Sammlung erzeugt – beim Kompilieren, keine eigene Datei',
+                    action: 'Sammlung öffnen', route: '/collection/' + this.collection.id,
+                });
+            }
+            for (const d of this.documents) {
+                const kind = atlasFileKind(d.name);
+                out.push({
+                    key: 'doc:' + d.name, name: d.name, kind, icon: kind === 'Abbildung' ? 'grid' : 'doc',
+                    note: this.docNote(d, kind), action: 'Öffnen', open: true, removable: true,
+                    fresh: this.fresh.includes(d.name),
+                });
+            }
+            return out;
+        },
+        rows() { return (this.literature && this.literature.rows) || []; },
+        counts() {
+            return (this.literature && this.literature.counts)
+                || { total: 0, cited_in_library: 0, uncited: 0, cited_missing: 0, missing: 0 };
+        },
+        sourceLabel() {
+            const kind = this.literature && this.literature.source && this.literature.source.kind;
+            return kind === 'collection' ? 'Sammlung' : 'Literaturliste';
+        },
+        sourceUncitedLabel() {
+            return this.sourceLabel === 'Sammlung' ? 'in der Sammlung, noch nicht zitiert' : 'in der Literaturliste, noch nicht zitiert';
+        },
+        barAria() {
+            const c = this.counts;
+            return c.total + ' Paper: ' + c.cited_in_library + ' zitiert und in der Bibliothek, '
+                + c.uncited + ' noch nicht zitiert, ' + c.cited_missing + ' zitiert und fehlen in der Bibliothek';
+        },
+        missingRows() { return this.rows.filter((r) => !r.in_library); },
+        filters() {
+            const c = this.counts;
+            const n = { all: c.total, missing: c.missing, uncited: c.uncited };
+            return ATLAS_LIT_FILTERS.map((f) => ({ ...f, count: n[f.key] }));
+        },
+        shownRows() {
+            if (this.filter === 'missing') return this.rows.filter((r) => !r.in_library);
+            if (this.filter === 'uncited') return this.rows.filter((r) => !r.cited);
+            return this.rows;
+        },
+        pasteSummary() {
+            const r = this.pasteResult;
+            if (!this.paste.trim() || !r || !r.keys.length) return 'Noch kein \\cite erkannt.';
+            const n = r.keys.length;
+            return n + (n === 1 ? ' Zitat erkannt · ' : ' Zitate erkannt · ') + r.counts.in_library + ' in der Bibliothek'
+                + (r.counts.missing ? ' · ' + r.counts.missing + ' fehlen' : '');
+        },
+        pasteTone() {
+            const r = this.pasteResult;
+            if (!r || !r.keys.length || !this.paste.trim()) return '';
+            return r.counts.missing ? 'is-danger' : 'is-ok';
+        },
+        dates() {
+            const p = this.pub;
+            const out = [];
+            if (p.due) {
+                const days = atlasDaysBetween(this.today, p.due);
+                const overdue = days !== null && days < 0;
+                out.push({
+                    key: 'due', icon: overdue ? 'alert' : 'flag', tone: overdue ? 'danger' : 'accent',
+                    title: p.status === 'in-revision' ? 'Revisionsfrist' : 'Frist',
+                    sub: atlasShortDay(p.due) + ', ' + atlasFormatDate(p.due, { day: 'numeric', month: 'short', year: 'numeric' })
+                        + ' · ' + (overdue ? 'überfällig' : atlasInDays(days)) + ' · steht im Kalender',
+                });
+            }
+            if (p.submitted) {
+                out.push({ key: 'sub', icon: 'clock', tone: '', title: 'Eingereicht',
+                    sub: atlasFormatDate(p.submitted, { day: 'numeric', month: 'short', year: 'numeric' }) });
+            }
+            if (p.published) {
+                out.push({ key: 'pub', icon: 'check', tone: '', title: 'Veröffentlicht',
+                    sub: atlasFormatDate(p.published, { day: 'numeric', month: 'short', year: 'numeric' }) });
+            }
+            return out;
+        },
+        belongs() {
+            const out = [];
+            for (const c of this.chapters) {
+                if ((c.publications || []).includes(this.id)) {
+                    out.push({ key: 'ch:' + c.id, label: 'Dissertation', title: c.title || c.id,
+                        to: { path: '/atlas/sammlung', query: { tab: 'dissertation', chapter: c.id } } });
+                }
+            }
+            for (const pr of (this.pub && this.pub.projects_resolved) || []) {
+                out.push({ key: 'pr:' + pr.id, label: 'Projekt', title: pr.title || pr.id,
+                    to: pr.found ? { path: '/atlas/sammlung', query: { tab: 'projekte', proj: pr.id } } : null });
+            }
+            for (const o of (this.pub && this.pub.origins) || []) {
+                out.push({ key: 'id:' + o.id, label: 'Idee', title: o.title || o.id,
+                    to: o.kind === 'idea' ? { path: '/atlas/sammlung', query: { tab: 'ideen', idea: o.id } } : null });
+            }
+            const notes = (this.backlinks && this.backlinks.zettel) || [];
+            if (notes.length === 1) {
+                out.push({ key: 'notes', label: 'Notizen', title: '1 Notiz verweist hierher',
+                    to: '/atlas/zettel/' + encodeURIComponent(notes[0].id) });
+            } else if (notes.length > 1) {
+                out.push({ key: 'notes', label: 'Notizen', title: notes.length + ' Notizen verweisen hierher',
+                    to: '/atlas/zettel/' + encodeURIComponent(notes[0].id) });
+            }
+            return out;
+        },
+    },
+    watch: {
+        id() { this.load(); },
+    },
+    methods: {
+        editorRoute(id) { return atlasEditorRoute(id); },
+        shortDay(iso) { return atlasShortDay(iso) + ' ' + (atlasDate(iso) ? atlasDate(iso).getDate() + '.' : ''); },
+        pct(n) { return (this.counts.total ? (n / this.counts.total * 100).toFixed(1) : 0) + '%'; },
+        who(r) {
+            const first = String(r.authors || '').split(/;| and /)[0].trim();
+            const name = first ? first.split(',')[0].trim() : '';
+            const more = String(r.authors || '').split(/;| and /).length > 1 ? ' et al.' : '';
+            const out = [name ? name + more : '', r.year || ''].filter(Boolean).join(' ');
+            // Ohne Angaben steht der Cite Key — außer er ist schon der Titel.
+            return out || (r.title ? r.key : '');
+        },
+        docNote(d, kind) {
+            const fresh = this.fresh.includes(d.name);
+            const size = d.size >= 1024 * 1024 ? (d.size / 1024 / 1024).toFixed(1) + ' MB'
+                : Math.max(1, Math.round((d.size || 0) / 1024)) + ' KB';
+            const hint = kind === 'BibTeX' ? ' · Titel und DOI fehlender Paper kommen von hier'
+                : kind === 'PDF' ? ' · z. B. Gutachten oder eingereichte Fassung' : '';
+            return (fresh ? 'gerade hinzugefügt · ' : '') + size + hint;
+        },
+        url(suffix = '') {
+            return '/api/plugins/atlas/publications/' + encodeURIComponent(this.id) + suffix;
+        },
+        async load(silent = false) {
+            if (!this.id) return;
+            if (!silent) this.loading = true;
+            try {
+                this.pub = await api(this.url());
+                this.missing = false;
+            } catch (e) {
+                this.pub = null;
+                this.missing = true;
+                this.loading = false;
+                return;
+            }
+            this.loading = false;
+            await Promise.all([this.loadLiterature(), this.loadDocuments(), this.loadSide()]);
+        },
+        async loadLiterature() {
+            try { this.literature = await api(this.url('/literature')); } catch (e) { this.literature = null; }
+        },
+        async loadDocuments() {
+            try {
+                const data = await api(this.url('/documents'));
+                this.documents = data.documents || [];
+                this.folder = data.folder || ('veroeffentlichungen/' + this.id + '/');
+            } catch (e) {
+                this.documents = [];
+                this.folder = 'veroeffentlichungen/' + this.id + '/';
+            }
+        },
+        async loadSide() {
+            const [tasks, diss, back] = await Promise.all([
+                api('/api/plugins/atlas/journal/tasks?anchor=' + encodeURIComponent(this.id)).catch(() => null),
+                api('/api/plugins/atlas/diss').catch(() => null),
+                api('/api/plugins/atlas/backlinks/' + encodeURIComponent(this.id)).catch(() => null),
+            ]);
+            this.tasks = (tasks && tasks.tasks) || [];
+            this.chapters = (diss && diss.chapters) || [];
+            this.backlinks = back;
+        },
+        // Nur, was die gemeldeten Arten betreffen — vor allem der
+        // Literatur-Abgleich (eine Bibliotheksabfrage je Cite Key) läuft nicht
+        // bei jeder abgehakten Aufgabe neu.
+        // Projekte und Ideen stehen in der Veröffentlichung selbst
+        // (`projects_resolved`, `origins` für „Gehört zu"): sie holen nur sie
+        // neu, nicht den Literatur-Abgleich.
+        reloadFor(kinds) {
+            if (atlasTouches(kinds, ['publication', 'collection'])) return this.load(true);
+            if (!this.pub) return null;
+            const parts = [];
+            if (atlasTouches(kinds, ['project', 'idea'])) parts.push(this.loadPub());
+            if (atlasTouches(kinds, ['manuscript', 'publication_document'])) parts.push(this.loadLiterature());
+            if (atlasTouches(kinds, ['publication_document'])) parts.push(this.loadDocuments());
+            if (atlasTouches(kinds, ['journal', 'diss_node', 'zettel', 'idea'])) parts.push(this.loadSide());
+            return Promise.all(parts);
+        },
+        async loadPub() {
+            try { this.pub = await api(this.url()); } catch (e) { /* bleibt; das nächste volle Laden entscheidet */ }
+        },
+        async setStatus(key) {
+            if (!this.pub || this.pub.status === key || this.busy) return;
+            this.busy = true;
+            try {
+                await atlasChangeStatus(this.pub, key, () => this.load(true));
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.busy = false;
+        },
+        onSaved() {
+            this.editOpen = false;
+            this.load(true);
+        },
+        // --- Dateien ------------------------------------------------------
+        onDragOver(e) {
+            const types = (e.dataTransfer && e.dataTransfer.types) || [];
+            if (!Array.from(types).includes('Files')) return;
+            try { e.dataTransfer.dropEffect = 'copy'; } catch (err) { /* ignore */ }
+            this.dropOver = true;
+        },
+        onDragLeave(e) {
+            const to = e.relatedTarget;
+            if (to && e.currentTarget && e.currentTarget.contains(to)) return;
+            this.dropOver = false;
+        },
+        onDrop(e) {
+            this.dropOver = false;
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+            if (files.length && this.pub) this.addFiles(files);
+        },
+        onPick(e) {
+            const files = Array.from(e.target.files || []);
+            e.target.value = '';
+            if (files.length) this.addFiles(files);
+        },
+        // Eine .tex wird Manuskript (bestehender Upload + Verknüpfung), alles
+        // andere landet im Dokumentordner der Veröffentlichung.
+        async addFiles(files) {
+            this.uploading = true;
+            const added = [];
+            for (const file of files) {
+                try {
+                    const fd = new FormData();
+                    fd.append('file', file);
+                    if (/\.tex$/i.test(file.name)) {
+                        const created = await this.postForm('/api/plugins/atlas/manuscripts/upload', fd);
+                        await api(this.url('/manuscripts'), { method: 'POST', body: JSON.stringify({ name: created.id + '.tex' }) });
+                        added.push(created.id + '.tex');
+                    } else {
+                        const meta = await this.postForm(this.url('/documents'), fd);
+                        added.push(meta.name);
+                    }
+                } catch (e) {
+                    atlasToast(file.name + ': ' + atlasErrorText(e), { tone: 'danger' });
+                }
+            }
+            this.uploading = false;
+            this.fresh = [...added, ...this.fresh];
+            if (added.length) {
+                atlasToast(added.length === 1 ? '„' + added[0] + '“ liegt jetzt bei diesem Beitrag.'
+                    : added.length + ' Dateien liegen jetzt bei diesem Beitrag.');
+            }
+            await this.load(true);
+        },
+        async postForm(url, fd) {
+            const resp = await fetch(url, { method: 'POST', body: fd });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ detail: 'Upload fehlgeschlagen' }));
+                throw new Error(err.detail || 'Upload fehlgeschlagen');
+            }
+            return resp.json();
+        },
+        async openDocument(name) {
+            try {
+                await api(this.url('/documents/' + encodeURIComponent(name) + '/open'), { method: 'POST' });
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+        },
+        async removeDocument(name) {
+            if (!confirm('„' + name + '“ aus dem Ordner dieses Beitrags löschen?')) return;
+            try {
+                await api(this.url('/documents/' + encodeURIComponent(name)), { method: 'DELETE' });
+                atlasToast('„' + name + '“ gelöscht.');
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            await this.loadDocuments();
+            await this.loadLiterature();
+        },
+        // --- Text einfügen --------------------------------------------------
+        schedulePasteCheck() {
+            if (this._pasteTimer) clearTimeout(this._pasteTimer);
+            this._pasteTimer = setTimeout(() => { this._pasteTimer = null; this.checkPaste(); }, 250);
+        },
+        async checkPaste() {
+            if (!this.paste.trim()) { this.pasteResult = null; return; }
+            try {
+                this.pasteResult = await api(this.url('/check-citations'), {
+                    method: 'POST', body: JSON.stringify({ text: this.paste }),
+                });
+            } catch (e) {
+                this.pasteResult = null;
+            }
+        },
+        async savePaste() {
+            const text = this.paste;
+            if (!text.trim() || this.savingPaste) return;
+            this.savingPaste = true;
+            try {
+                const name = 'eingefuegt-' + atlasTodayIso() + '.tex';
+                await this.addFiles([new File([text], name, { type: 'text/x-tex' })]);
+                this.paste = '';
+                this.pasteResult = null;
+                this.pasteOpen = false;
+            } finally {
+                this.savingPaste = false;
+            }
+        },
+        // --- Öffnen ---------------------------------------------------------
+        openLocal(r) {
+            if (r.item_id !== null && r.item_id !== undefined) this.$router.push('/paper/' + r.item_id);
+        },
+        openWeb(r) { atlasOpenTabs([atlasWebUrl(r)]); },
+        openMain(r) { if (r.in_library) this.openLocal(r); else this.openWeb(r); },
+        openAll() { atlasOpenTabs(this.shownRows.map(atlasWebUrl)); },
+        openMissing() { atlasOpenTabs(this.missingRows.map(atlasWebUrl)); },
+        // Atlas legt nichts selbst an (P2): der Import des Kerns zeigt die
+        // DOIs, prüft, was schon in der Bibliothek liegt, und legt erst nach
+        // Bestätigung an (#227). Die Sammlung der Veröffentlichung ist dort
+        // als Ziel vorgewählt — abwählbar.
+        importMissing() {
+            const dois = [...new Set(this.missingRows.filter((r) => r.doi).map((r) => r.doi))];
+            if (!dois.length) { atlasToast('Keines der fehlenden Paper hat eine DOI.'); return; }
+            this.$router.push(atlasImportRoute(dois, this.collection ? this.collection.id : null));
+        },
+        async copyDois() {
+            const dois = this.missingRows.filter((r) => r.doi).map((r) => r.doi);
+            if (!dois.length) { atlasToast('Keines der fehlenden Paper hat eine DOI.'); return; }
+            const ok = await atlasCopy(dois.join('\n'));
+            atlasToast(ok ? (dois.length === 1 ? '1 DOI kopiert.' : dois.length + ' DOIs kopiert.')
+                : 'Kopieren ging nicht – dein Browser erlaubt keinen Zugriff auf die Zwischenablage.');
+        },
+        downloadBib() {
+            const ok = atlasDownload('fehlende-literatur-' + this.id + '.bib', atlasBibFor(this.missingRows), 'application/x-bibtex');
+            if (!ok) atlasToast('Download ging nicht.', { tone: 'danger' });
+        },
+        // --- Aufgaben -------------------------------------------------------
+        async toggleTask(t) {
+            try {
+                await api('/api/plugins/atlas/journal/' + encodeURIComponent(t.week) + '/tasks/' + t.body_index + '/toggle', { method: 'POST' });
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            await this.loadSide();
+        },
+        newTask() {
+            atlasOpenNew('task', { links: [{ id: this.id, kind: 'publication', title: this.pub.title }] });
+        },
+    },
+    mounted() {
+        this.load();
+        atlasLoadEntities();
+        if (!atlasWork.today) atlasRefreshToday();
+        this._live = atlasLiveReload((kinds) => this.reloadFor(kinds));
+    },
+    beforeUnmount() {
+        if (this._live) { this._live.close(); this._live = null; }
+        if (this._pasteTimer) { clearTimeout(this._pasteTimer); this._pasteTimer = null; }
+    },
+};
+
+// ── Publikationsliste (#228) ────────────────────────────────────────────────
+// Entsteht aus allem in „Veröffentlicht": der Server setzt die Einträge
+// (atlas/publication_list.py — APA, IEEE, DIN ISO 690, der eigene Name fett,
+// Band/Heft/Seiten/DOI aus dem verknüpften Bibliothekseintrag), die Seite
+// zeigt sie, kopiert und lädt .bib/LaTeX herunter. „Eigenes Paper per DOI
+// verknüpfen" fragt den DOI-Existenz-Check des Kerns (stabil laut
+// plugin_api/AUTHORING.md): gefunden → Atlas setzt `paper` in seiner Datei
+// (den Cite Key nennt der BibTeX-Endpunkt des Items), nicht gefunden → der
+// Import des Kerns mit dieser DOI. Kein CrossRef-Abruf in Atlas, kein
+// Schreiben in die Bibliothek (P2).
+const ATLAS_CITATION_STYLES = [
+    { key: 'apa', label: 'APA' },
+    { key: 'ieee', label: 'IEEE' },
+    { key: 'din', label: 'DIN ISO 690' },
+];
+const ATLAS_PUBLIST_FILTERS = [
+    { key: 'all', label: 'Alle' },
+    { key: 'journal', label: 'Nur Journal' },
+    { key: 'diss', label: 'Für die Dissertation' },
+];
+const ATLAS_PENDING_CHIP = { submitted: 'eingereicht', 'in-revision': 'in Begutachtung' };
+// Reihenfolge in „Verknüpfen": Veröffentlichtes ohne Paper zuerst.
+const ATLAS_LINK_ORDER = ['published', 'submitted', 'in-revision', 'drafting', 'planned'];
+
+const AtlasPublicationListPage = {
+    components: { 'atlas-nav': AtlasNav, 'atlas-icon': AtlasIcon },
+    template: `
+        <div class="atlas-page atlas-shell" lang="de">
+            <atlas-nav active="veroeffentlichungen" />
+
+            <header class="atlas-detail-header">
+                <router-link :to="backRoute" class="atlas-back"><atlas-icon name="back" :size="16" /> Veröffentlichungen</router-link>
+                <div class="atlas-detail-titlerow">
+                    <div class="atlas-detail-titles">
+                        <h1 class="atlas-title">Publikationsliste</h1>
+                        <p class="atlas-subtitle">Entsteht automatisch aus allem, was in der Spalte „Veröffentlicht“ liegt. Du trägst nichts doppelt ein – Lebenslauf, Antrag und Dissertation greifen auf dieselbe Liste zu.</p>
+                    </div>
+                    <div class="atlas-header-actions">
+                        <button type="button" class="atlas-btn is-primary is-tall" :disabled="!total" @click="copyAll">
+                            <atlas-icon name="copy" /> {{ copied ? 'Kopiert' : 'Liste kopieren' }}
+                        </button>
+                        <button type="button" class="atlas-btn is-tall" :disabled="!total" @click="exportAs('bib')">.bib</button>
+                        <button type="button" class="atlas-btn is-tall" :disabled="!total" @click="exportAs('latex')">LaTeX</button>
+                    </div>
+                </div>
+            </header>
+
+            <div class="atlas-columns">
+                <section class="atlas-panel atlas-col-main atlas-publist" aria-label="Liste">
+                    <div class="atlas-publist-bar">
+                        <fieldset class="atlas-seg">
+                            <legend class="atlas-sr">Zitierstil</legend>
+                            <label v-for="s in styles" :key="s.key" class="atlas-seg-item" :class="{ 'is-active': style === s.key }">
+                                <input type="radio" name="atlas-zitierstil" class="atlas-sr" :value="s.key" v-model="style" />{{ s.label }}
+                            </label>
+                        </fieldset>
+                        <fieldset class="atlas-chip-row atlas-plain-fieldset">
+                            <legend class="atlas-sr">Auswahl</legend>
+                            <label v-for="f in filters" :key="f.key" class="atlas-choice" :class="{ 'is-on': selection === f.key }">
+                                <input type="radio" name="atlas-auswahl" class="atlas-sr" :value="f.key" v-model="selection" />{{ f.label }}<span class="atlas-mono-sub">{{ counts[f.key] || 0 }}</span>
+                            </label>
+                        </fieldset>
+                    </div>
+                    <p v-if="data && !data.own_name" class="atlas-publist-hint" role="note">
+                        Dein Name ist noch nicht hinterlegt. Trag ihn unter Einstellungen › Add-ons › Atlas bei „Dein Name“ ein, dann steht er in jedem Eintrag fett.
+                    </p>
+                    <div class="atlas-publist-body" aria-live="polite">
+                        <p v-if="loading" class="atlas-muted atlas-publist-empty">Lädt…</p>
+                        <div v-for="g in groups" :key="g.key" class="atlas-publist-group">
+                            <h2 class="atlas-publist-year">{{ g.label }}</h2>
+                            <ol class="atlas-publist-list">
+                                <li v-for="e in g.entries" :key="e.id" class="atlas-publist-entry" :data-entry="e.id">
+                                    <span v-if="e.number" class="atlas-publist-num">[{{ e.number }}]</span>
+                                    <div class="atlas-publist-main">
+                                        <p class="atlas-publist-ref"><span v-for="(s, i) in e.segments" :key="i" :class="{ 'is-bold': s.bold, 'is-italic': s.italic }">{{ s.text }}</span></p>
+                                        <div v-if="chips(e).length" class="atlas-publist-chips">
+                                            <span v-for="c in chips(e)" :key="c.label" class="atlas-pchip" :class="'is-' + c.tone" :title="c.title || null">{{ c.label }}</span>
+                                        </div>
+                                    </div>
+                                    <button type="button" class="atlas-icon-square is-small" :aria-label="'Eintrag kopieren: ' + e.title"
+                                            title="Eintrag kopieren" @click="copyEntry(e)"><atlas-icon name="copy" :size="16" /></button>
+                                </li>
+                            </ol>
+                        </div>
+                        <p v-if="!loading && !groups.length" class="atlas-muted atlas-publist-empty">
+                            {{ failed ? 'Die Liste ließ sich nicht laden.' : 'Für diese Auswahl gibt es noch keinen Eintrag.' }}
+                        </p>
+                        <label class="atlas-publist-submitted">
+                            <input type="checkbox" class="atlas-check" data-testid="atlas-publist-submitted" v-model="withSubmitted" />
+                            <span class="atlas-publist-submitted-text">
+                                <span class="atlas-publist-submitted-title">Eingereichte und begutachtete mit aufführen</span>
+                                <span class="atlas-muted">Erscheinen als „eingereicht“ bzw. „in Begutachtung“ – praktisch für Lebenslauf und Anträge.</span>
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <aside class="atlas-col-side">
+                    <section class="atlas-panel is-padded atlas-stack atlas-publist-link" aria-labelledby="atlas-h-link">
+                        <div>
+                            <h2 id="atlas-h-link" class="atlas-panel-title is-side">Eigenes Paper per DOI verknüpfen</h2>
+                            <p class="atlas-panel-note">Atlas sucht dein Paper in deiner Bibliothek. Band, Heft, Seiten und DOI kommen dann von dort – Atlas legt selbst nichts an.</p>
+                        </div>
+                        <div class="atlas-new-field">
+                            <label for="atlas-link-pub" class="atlas-new-legend">Veröffentlichung</label>
+                            <select id="atlas-link-pub" v-model="linkPubId" class="atlas-input" :disabled="!linkable.length">
+                                <option v-if="!linkable.length" value="">Noch keine Veröffentlichung</option>
+                                <option v-for="p in linkable" :key="p.id" :value="p.id">{{ optionLabel(p) }}</option>
+                            </select>
+                        </div>
+                        <form class="atlas-new-field" @submit.prevent="linkByDoi">
+                            <label for="atlas-link-doi" class="atlas-new-legend">DOI oder Link</label>
+                            <div class="atlas-publist-doirow">
+                                <input id="atlas-link-doi" ref="doiInput" v-model="doi" type="text" class="atlas-input atlas-mono-input"
+                                       placeholder="10.… oder https://doi.org/10.…" autocomplete="off" spellcheck="false" />
+                                <button type="submit" class="atlas-btn is-tall" :disabled="!canLink">{{ linking ? 'Sucht…' : 'Verknüpfen' }}</button>
+                            </div>
+                        </form>
+                        <div v-if="linkResult && linkResult.state === 'missing'" class="atlas-publist-result atlas-publist-missing" role="status">
+                            <span class="atlas-lib is-missing"><atlas-icon name="alert" :size="14" /> Nicht in deiner Bibliothek</span>
+                            <p class="atlas-missing-note">Zu <span class="atlas-mono">{{ linkResult.doi }}</span> gibt es noch keinen Eintrag. „In LocalBib importieren“ öffnet dort den Import mit dieser DOI – Atlas legt nichts selbst an. Danach hier noch einmal verknüpfen.</p>
+                            <button type="button" class="atlas-btn is-primary" @click="importDoi"><atlas-icon name="download" :size="16" /> In LocalBib importieren</button>
+                        </div>
+                        <div v-else-if="linkResult && linkResult.state === 'linked'" class="atlas-publist-result" role="status">
+                            <span class="atlas-lib is-pdf"><atlas-icon name="check" :size="14" /> Verknüpft</span>
+                            <p class="atlas-missing-note">„{{ linkResult.title }}“ nimmt Band, Heft, Seiten und DOI jetzt aus deiner Bibliothek.</p>
+                        </div>
+                    </section>
+
+                    <section class="atlas-panel is-padded atlas-stack" aria-labelledby="atlas-h-diss">
+                        <div>
+                            <h2 id="atlas-h-diss" class="atlas-panel-title is-side">Für die Dissertation</h2>
+                            <p class="atlas-panel-note">Welche Kapitel auf eigenen Veröffentlichungen aufbauen – für den Abschnitt „Vorveröffentlichungen“.</p>
+                        </div>
+                        <ul v-if="dissertation.length" class="atlas-publist-diss">
+                            <li v-for="c in dissertation" :key="c.id">
+                                <span class="atlas-publist-diss-ch">{{ c.label }}</span>
+                                <span v-for="i in c.items" :key="i.id" class="atlas-publist-diss-item" :class="{ 'is-open': i.state === 'open' }">{{ i.state === 'open' ? i.short + ' – noch in Arbeit' : i.short }}</span>
+                            </li>
+                        </ul>
+                        <p v-else class="atlas-muted">Noch kein Kapitel ist mit einer Veröffentlichung verknüpft. Das geht im Kapitel unter Schreiben › Dissertation.</p>
+                        <button type="button" class="atlas-btn is-tall" :disabled="!dissertationText" @click="copyDissertation">
+                            <atlas-icon name="copy" :size="16" /> Liste der Vorveröffentlichungen kopieren
+                        </button>
+                    </section>
+                </aside>
+            </div>
+        </div>
+    `,
+    data() {
+        return {
+            data: null,
+            loading: true,
+            failed: false,
+            style: 'apa',
+            selection: 'all',
+            withSubmitted: false,
+            copied: false,
+            pubs: [],
+            linkPubId: '',
+            doi: '',
+            linking: false,
+            linkResult: null,
+        };
+    },
+    computed: {
+        backRoute() { return ATLAS_PUBLICATIONS_ROUTE; },
+        styles() { return ATLAS_CITATION_STYLES; },
+        filters() { return ATLAS_PUBLIST_FILTERS; },
+        counts() { return (this.data && this.data.counts) || {}; },
+        groups() { return (this.data && this.data.groups) || []; },
+        total() { return this.groups.reduce((n, g) => n + g.entries.length, 0); },
+        dissertation() { return (this.data && this.data.dissertation) || []; },
+        dissertationText() { return (this.data && this.data.dissertation_text) || ''; },
+        // Jede nicht abgelehnte Veröffentlichung, Veröffentlichtes ohne Paper vorn.
+        linkable() {
+            const rank = (p) => {
+                const i = ATLAS_LINK_ORDER.indexOf(p.status);
+                return (i < 0 ? ATLAS_LINK_ORDER.length : i) * 2 + (p.status === 'published' && p.paper ? 1 : 0);
+            };
+            return this.pubs
+                .filter((p) => !ATLAS_PIPELINE_CLOSED.has(p.status))
+                .slice()
+                .sort((a, b) => rank(a) - rank(b) || (a.title || '').localeCompare(b.title || '', 'de-DE'));
+        },
+        linkPub() { return this.pubs.find((p) => p.id === this.linkPubId) || null; },
+        canLink() { return !!this.linkPub && !!atlasBareDoi(this.doi) && !this.linking; },
+    },
+    watch: {
+        style() { this.changed(); },
+        selection() { this.changed(); },
+        withSubmitted() { this.changed(); },
+        doi() { if (this.linkResult && this.linkResult.state === 'missing') this.linkResult = null; },
+        '$route.query.verknuepfen'(v) { if (v) this.preselect(v); },
+    },
+    methods: {
+        query(extra = {}) {
+            return new URLSearchParams({
+                style: this.style, selection: this.selection, submitted: this.withSubmitted ? 'true' : 'false', ...extra,
+            }).toString();
+        },
+        changed() {
+            this.copied = false;
+            this.load();
+        },
+        // Eine spätere Anfrage gewinnt: schneller Stilwechsel zeigt nie eine alte Antwort.
+        async load() {
+            const ticket = (this._ticket = (this._ticket || 0) + 1);
+            try {
+                const data = await api('/api/plugins/atlas/publication-list?' + this.query());
+                if (ticket !== this._ticket) return;
+                this.data = data;
+                this.failed = false;
+            } catch (e) {
+                if (ticket !== this._ticket) return;
+                this.failed = true;
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+            this.loading = false;
+        },
+        // Lädt nur und hält die Wahl gültig — ein Nachladen (nach dem
+        // Verknüpfen, per SSE) wählt nie neu vor und lässt die Bestätigung stehen.
+        async loadPubs() {
+            try {
+                this.pubs = (await api('/api/plugins/atlas/publications')).publications || [];
+            } catch (e) { /* der Kasten bleibt leer */ }
+            this.keepLinkTarget();
+        },
+        refresh() { return Promise.all([this.load(), this.loadPubs()]); },
+        reloadFor(kinds) {
+            if (atlasTouches(kinds, ['publication', 'collection', 'diss_node'])) return this.refresh();
+            return null;
+        },
+        // `wanted` aus „DOI eintragen" (Pipeline): nur beim ersten Laden und
+        // wenn sich `?verknuepfen=` wirklich ändert, nie bei einem Nachladen.
+        preselect(wanted) {
+            if (wanted && this.linkable.some((p) => p.id === wanted)) {
+                this.linkPubId = wanted;
+                this.linkResult = null;
+                this.$nextTick(() => { if (this.$refs.doiInput) this.$refs.doiInput.focus(); });
+                return;
+            }
+            this.keepLinkTarget();
+        },
+        // Die Wahl bleibt, solange es sie gibt; sonst das erste
+        // Veröffentlichte ohne eigenes Paper.
+        keepLinkTarget() {
+            const list = this.linkable;
+            if (this.linkPubId && list.some((p) => p.id === this.linkPubId)) return;
+            const first = list.find((p) => p.status === 'published' && !p.paper) || list[0];
+            this.linkPubId = first ? first.id : '';
+        },
+        optionLabel(p) {
+            const parts = [p.title || p.id];
+            if (p.status !== 'published') parts.push(ATLAS_PUBLICATION_STATUS_LABEL[p.status] || p.status);
+            if (p.paper) parts.push('verknüpft');
+            return parts.join(' · ');
+        },
+        chips(e) {
+            const out = [];
+            if (e.has_pdf) out.push({ label: 'PDF in der Bibliothek', tone: 'ok' });
+            for (const c of e.chapters || []) out.push({ label: 'Grundlage für Kapitel ' + c.number, tone: 'soft', title: c.title });
+            if (e.pending) out.push({ label: ATLAS_PENDING_CHIP[e.pending] || e.pending, tone: 'warn' });
+            return out;
+        },
+        async copyText(text, done) {
+            const ok = await atlasCopy(text);
+            atlasToast(ok ? done : 'Kopieren ging nicht – dein Browser erlaubt keinen Zugriff auf die Zwischenablage.',
+                ok ? {} : { tone: 'danger' });
+            return ok;
+        },
+        async copyAll() {
+            if (this.data) this.copied = await this.copyText(this.data.text, 'Liste kopiert.');
+        },
+        copyEntry(e) { return this.copyText(e.text, 'Eintrag kopiert.'); },
+        copyDissertation() { return this.copyText(this.dissertationText, 'Vorveröffentlichungen kopiert.'); },
+        async exportAs(format) {
+            try {
+                const out = await api('/api/plugins/atlas/publication-list/export?' + this.query({ format }));
+                if (atlasDownload(out.filename, out.content, out.mime)) atlasToast(out.filename + ' heruntergeladen.');
+                else atlasToast('Download ging nicht.', { tone: 'danger' });
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            }
+        },
+        // Gefunden → `paper` in der eigenen Datei (partielles Update, mit
+        // Rückgängig); nicht gefunden → der Weg in den Import des Kerns.
+        async linkByDoi() {
+            const doi = atlasBareDoi(this.doi);
+            const pub = this.linkPub;
+            if (!doi || !pub || this.linking) return;
+            this.linking = true;
+            this.linkResult = null;
+            try {
+                const res = await api('/api/papers/by-doi/exists', { method: 'POST', body: JSON.stringify({ dois: [doi] }) });
+                const itemId = ((res && res.papers) || {})[doi];
+                if (itemId === null || itemId === undefined) {
+                    this.linkResult = { state: 'missing', doi, title: pub.title };
+                    return;
+                }
+                const bib = await api(`/api/papers/${itemId}/bibtex`);
+                const key = bib && bib.key;
+                if (!key) throw new Error('Das Paper in der Bibliothek hat keinen Cite Key.');
+                const previous = pub.paper || null;
+                await this.setPaper(pub.id, key);
+                this.doi = '';
+                this.linkResult = { state: 'linked', doi, title: pub.title, key };
+                atlasToast('„' + pub.title + '“ ist mit deinem Paper verknüpft – Band, Heft, Seiten und DOI kommen jetzt aus der Bibliothek.', {
+                    actionLabel: 'Rückgängig',
+                    action: async () => {
+                        try {
+                            await this.setPaper(pub.id, previous);
+                            this.linkResult = null;
+                            atlasToast('Rückgängig gemacht.');
+                        } catch (e) {
+                            atlasToast(atlasErrorText(e), { tone: 'danger' });
+                        }
+                        await this.refresh();
+                    },
+                });
+                await this.refresh();
+            } catch (e) {
+                atlasToast(atlasErrorText(e), { tone: 'danger' });
+            } finally {
+                this.linking = false;
+            }
+        },
+        setPaper(pubId, key) {
+            return api('/api/plugins/atlas/publications/' + encodeURIComponent(pubId), {
+                method: 'PUT', body: JSON.stringify({ paper: key }),
+            });
+        },
+        importDoi() {
+            if (this.linkResult && this.linkResult.doi) this.$router.push(atlasImportRoute([this.linkResult.doi]));
+        },
+    },
+    mounted() {
+        this.load();
+        // Erstes Laden: die Vorwahl aus `?verknuepfen=` gilt genau hier
+        // (und im Watcher, wenn sie sich ändert).
+        this.loadPubs().then(() => this.preselect(this.$route.query.verknuepfen));
+        atlasLoadEntities();
+        if (!atlasWork.today) atlasRefreshToday();
+        this._live = atlasLiveReload((kinds) => this.reloadFor(kinds));
+    },
+    beforeUnmount() {
+        if (this._live) { this._live.close(); this._live = null; }
+    },
 };
 
 // =============================================================================
@@ -6723,17 +9840,26 @@ LB.registerPlugin({
         // /atlas ist die Werkbank-Startseite "Heute" (#180, Story 58); die
         // Sammlung (Ideen, Veroeffentlichungen, Kapitel, Projekte) liegt auf
         // /atlas/sammlung.
-        'atlas.today': AtlasTodayPage,
-        'atlas.week': AtlasWeekPage,
-        'atlas.review': AtlasReviewPage,
+        'atlas.today': AtlasOverviewPage,
+        // Kalender (#224): die Wochenroute; die Rückblick-Route öffnet ihn im
+        // Rückblick-Modus.
+        'atlas.week': AtlasCalendarPage,
+        'atlas.review': AtlasCalendarPage,
         'atlas.collection': AtlasPage,
         'atlas.zettel': AtlasZettelPage,
+        'atlas.publications': AtlasPipelinePage,
+        'atlas.publication': AtlasPublicationPage,
+        // Publikationsliste (#228): eigene Adresse neben der Pipeline.
+        'atlas.publication-list': AtlasPublicationListPage,
     },
     subroutes: [
         { path: '/atlas/woche/:week?', view: 'atlas.week' },
         { path: '/atlas/rueckblick/:week?', view: 'atlas.review' },
         { path: '/atlas/sammlung', view: 'atlas.collection' },
         { path: '/atlas/zettel/:id?', view: 'atlas.zettel' },
+        { path: '/atlas/veroeffentlichungen', view: 'atlas.publications' },
+        { path: '/atlas/veroeffentlichungen/:id', view: 'atlas.publication' },
+        { path: '/atlas/publikationsliste', view: 'atlas.publication-list' },
     ],
     slots: {
         'item-list-filter': { key: 'atlas.project-filter', component: AtlasItemListFilter },

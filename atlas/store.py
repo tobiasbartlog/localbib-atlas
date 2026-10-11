@@ -19,7 +19,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
-from atlas import config, entity_store, index_links, journal_store
+from atlas import collection_entries, config, entity_store, index_links, journal_store
 from atlas.domain import (
     DissNode,
     Idea,
@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS projects (
     tags         TEXT NOT NULL DEFAULT '[]',
     refs         TEXT NOT NULL DEFAULT '[]',
     milestones   TEXT NOT NULL DEFAULT '[]',
+    collection_id INTEGER,
+    kind         TEXT,
     body         TEXT NOT NULL DEFAULT '',
     path         TEXT,
     content_hash TEXT NOT NULL DEFAULT '',
@@ -112,6 +114,8 @@ CREATE TABLE IF NOT EXISTS publications (
     manuscripts  TEXT NOT NULL DEFAULT '[]',
     projects     TEXT NOT NULL DEFAULT '[]',
     paper        TEXT,
+    collection_id INTEGER,
+    kind         TEXT,
     body         TEXT NOT NULL DEFAULT '',
     path         TEXT,
     content_hash TEXT NOT NULL DEFAULT '',
@@ -157,6 +161,9 @@ def _serialized(method):
 class AtlasStore:
     def __init__(self, db_path=None) -> None:
         self._write_lock = threading.RLock()
+        # The core's Collections (ADR-0022) — overlaid at read time, never
+        # indexed. None: no overlay (no library, or a host before contract 2.1).
+        self._collections: Optional[collection_entries.CollectionSource] = None
         self.db_path = Path(db_path) if db_path else config.db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
@@ -167,8 +174,16 @@ class AtlasStore:
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(projects)").fetchall()
             }
-            if columns and "milestones" not in columns:
+            # atlas.project/4 + atlas.publication/2 (ADR-0022) add the
+            # Collection link columns — same rule: drop, reindex rebuilds.
+            if columns and ("milestones" not in columns or "collection_id" not in columns):
                 conn.execute("DROP TABLE projects")
+            pub_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(publications)").fetchall()
+            }
+            if pub_columns and "collection_id" not in pub_columns:
+                conn.execute("DROP TABLE publications")
             # atlas.dissnode/3 (issue #57, ADR-0005) flattens diss_nodes: kind
             # and parent are gone. Derived index — drop the old layout and let
             # the reindex rebuild it from the Markdown files.
@@ -373,14 +388,16 @@ class AtlasStore:
             conn.execute(
                 """INSERT INTO projects
                    (id, title, status, start, "end", funder, grant_id, role,
-                    tags, refs, milestones, body, path, content_hash, valid, errors)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    tags, refs, milestones, collection_id, kind, body, path,
+                    content_hash, valid, errors)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                      title=excluded.title, status=excluded.status,
                      start=excluded.start, "end"=excluded."end",
                      funder=excluded.funder, grant_id=excluded.grant_id,
                      role=excluded.role, tags=excluded.tags, refs=excluded.refs,
                      milestones=excluded.milestones,
+                     collection_id=excluded.collection_id, kind=excluded.kind,
                      body=excluded.body, path=excluded.path,
                      content_hash=excluded.content_hash, valid=excluded.valid,
                      errors=excluded.errors""",
@@ -390,6 +407,7 @@ class AtlasStore:
                     project.grant_id, project.role,
                     json.dumps(project.tags), json.dumps(project.refs),
                     json.dumps([normalize_milestone(m) for m in project.milestones]),
+                    project.collection_id, project.kind,
                     project.body, project.path, project.content_hash,
                     0 if errors else 1, json.dumps(errors),
                 ),
@@ -402,10 +420,17 @@ class AtlasStore:
         return entity_store.index_file(_PROJECT_SPEC, self, path)
 
     def get_project(self, project_id: str) -> Optional[Project]:
-        return entity_store.get_by_id(self._connect, _PROJECT_SPEC, project_id)
+        project = entity_store.get_by_id(self._connect, _PROJECT_SPEC, project_id)
+        if project is not None and self._collections is not None:
+            collection_entries.decorate(project, self._collections)
+        return project
 
     def list_projects(self) -> list[Project]:
-        return entity_store.list_all(self._connect, _PROJECT_SPEC)
+        projects = entity_store.list_all(self._connect, _PROJECT_SPEC)
+        if self._collections is not None:
+            for project in projects:
+                collection_entries.decorate(project, self._collections)
+        return projects
 
     def projects_for_citekey(self, citekey: str) -> list[Project]:
         """Research projects whose refs contain ``citekey`` — backward
@@ -429,8 +454,8 @@ class AtlasStore:
                 """INSERT INTO publications
                    (id, title, status, venue, type, authors, submitted, published,
                     due, tags, refs, derived_from, manuscripts, projects, paper,
-                    body, path, content_hash, valid, errors)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    collection_id, kind, body, path, content_hash, valid, errors)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                      title=excluded.title, status=excluded.status,
                      venue=excluded.venue, type=excluded.type,
@@ -439,7 +464,8 @@ class AtlasStore:
                      tags=excluded.tags, refs=excluded.refs,
                      derived_from=excluded.derived_from,
                      manuscripts=excluded.manuscripts, projects=excluded.projects,
-                     paper=excluded.paper, body=excluded.body, path=excluded.path,
+                     paper=excluded.paper, collection_id=excluded.collection_id,
+                     kind=excluded.kind, body=excluded.body, path=excluded.path,
                      content_hash=excluded.content_hash, valid=excluded.valid,
                      errors=excluded.errors""",
                 (
@@ -451,6 +477,7 @@ class AtlasStore:
                     json.dumps(publication.derived_from),
                     json.dumps(publication.manuscripts),
                     json.dumps(publication.projects), publication.paper,
+                    publication.collection_id, publication.kind,
                     publication.body, publication.path, publication.content_hash,
                     0 if errors else 1, json.dumps(errors),
                 ),
@@ -465,10 +492,40 @@ class AtlasStore:
         return entity_store.index_file(_PUBLICATION_SPEC, self, path)
 
     def get_publication(self, publication_id: str) -> Optional[Publication]:
-        return entity_store.get_by_id(self._connect, _PUBLICATION_SPEC, publication_id)
+        """A Publication file by id; a Collection entry is decorated with its
+        live Collection (ADR-0022). There are no virtual entries (ADR-0025)."""
+        publication = entity_store.get_by_id(self._connect, _PUBLICATION_SPEC, publication_id)
+        if self._collections is None or publication is None:
+            return publication
+        return collection_entries.decorate(publication, self._collections)
 
     def list_publications(self) -> list[Publication]:
-        return entity_store.list_all(self._connect, _PUBLICATION_SPEC)
+        """Every Publication file, Collection entries decorated live — a
+        Collection without a file is not a Publication (ADR-0025, #225)."""
+        rows = entity_store.list_all(self._connect, _PUBLICATION_SPEC)
+        if self._collections is None:
+            return rows
+        return collection_entries.publications_view(rows, self._collections)
+
+    # --- Collection entries (ADR-0022, issue #205) ---------------------------
+    def attach_collections(self, source) -> None:
+        """Hand the store the core's Collections (``CollectionSource``). Only a
+        source that can actually read Collections switches the overlay on."""
+        self._collections = source if source is not None and source.available else None
+
+    @property
+    def collections(self):
+        return self._collections
+
+    def collection_files(self) -> list:
+        """The indexed FILES that link a Collection (Publications and
+        Projects), undecorated — the tombstone reconcile's input."""
+        return [
+            entity
+            for spec in (_PUBLICATION_SPEC, _PROJECT_SPEC)
+            for entity in entity_store.list_all(self._connect, spec)
+            if entity.collection_id is not None
+        ]
 
     def delete_publication(self, publication_id: str) -> None:
         self._delete_entity(
@@ -620,6 +677,10 @@ class AtlasStore:
     @_serialized
     def move_task(self, week: str, body_index: int, to_day) -> dict:
         return journal_store.move_task(self._connect, week, body_index, to_day)
+
+    @_serialized
+    def undo_move(self, week: str, body_index: int, to_week: str, to_index: int) -> dict:
+        return journal_store.undo_move(self._connect, week, body_index, to_week, to_index)
 
     @_serialized
     def set_goals(self, week: str, goals) -> Journal:
@@ -951,6 +1012,8 @@ def _row_to_publication(row: sqlite3.Row) -> Publication:
         paper=row["paper"],
         body=row["body"],
         path=row["path"],
+        collection_id=row["collection_id"],
+        kind=row["kind"],
     )
 
 
@@ -983,6 +1046,8 @@ def _row_to_project(row: sqlite3.Row) -> Project:
         milestones=json.loads(row["milestones"]),
         body=row["body"],
         path=row["path"],
+        collection_id=row["collection_id"],
+        kind=row["kind"],
     )
 
 

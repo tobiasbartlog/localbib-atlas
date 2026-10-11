@@ -1,4 +1,5 @@
 {
   "atlas.nav.label": "Atlas",
-  "atlas.settings.base_dir": "Atlas-Ordner (leer: <Basisordner>/atlas)"
+  "atlas.settings.base_dir": "Atlas-Ordner (leer: <Basisordner>/atlas)",
+  "atlas.settings.own_name": "Dein Name (in der Publikationsliste fett, z. B. „Mustermann, T.“)"
 }

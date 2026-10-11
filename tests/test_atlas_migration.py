@@ -38,7 +38,7 @@ def test_plan_converts_legacy_v1_and_v2_to_valid_publications():
     for action in plan.actions:
         pub = Publication.from_markdown(action.content)
         assert pub.validate() == []
-        assert "schema: atlas.publication/1" in action.content
+        assert "schema: atlas.publication/2" in action.content
 
 
 def test_plan_carries_all_legacy_fields_over():

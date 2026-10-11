@@ -65,7 +65,7 @@ def projects_dir() -> Path:
 
 
 def publications_dir() -> Path:
-    """Publications (atlas.publication/1), see ADR-0004."""
+    """Publications (atlas.publication/2), see ADR-0004/ADR-0022."""
     return base_dir() / "veroeffentlichungen"
 
 

@@ -59,6 +59,8 @@ def _kind_for(path) -> str:
             return kind
     if parent.parent == config.projects_dir():
         return "project_document"
+    if parent.parent == config.publications_dir():
+        return "publication_document"
     return KIND_ARCHIVE
 
 
@@ -85,11 +87,13 @@ class _IdeaEventHandler(FileSystemEventHandler):
 
     @staticmethod
     def _is_project_document(path) -> bool:
-        # Project documents live in projekte/<id>/ (issue #49). They are never
+        # Project documents live in projekte/<id>/ (issue #49), publication
+        # documents in veroeffentlichungen/<id>/ (#226). They are never
         # indexed — the listing reads the directory — but external drops get an
-        # SSE ping so an open detail page refreshes. Only direct children of a
-        # project subfolder count; .atlas/ etc. stay silent.
-        return Path(path).parent.parent == config.projects_dir()
+        # SSE ping so an open detail page refreshes. Only direct children of an
+        # entity subfolder count; .atlas/ etc. stay silent.
+        grand = Path(path).parent.parent
+        return grand == config.projects_dir() or grand == config.publications_dir()
 
     def on_created(self, event) -> None:
         if not event.is_directory:

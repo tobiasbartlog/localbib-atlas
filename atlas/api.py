@@ -22,6 +22,8 @@ from pydantic import BaseModel
 from atlas import compiler, documents, manuscripts, project_extraction
 from atlas.api_journal import build_journal_router
 from atlas.api_links import build_links_router, chapter_metrics
+from atlas.api_publication import remove_entity_files
+from atlas.api_writing import build_writing_router, manuscript_bibliography
 from atlas.api_zettel import build_zettel_router
 from atlas.domain import (
     DissNode,
@@ -284,23 +286,13 @@ def _zettel_dict(zettel) -> dict:
 
 
 def _unique_publication_id(store, base: str) -> str:
-    base = base or "veroeffentlichung"
-    if store.get_publication(base) is None:
-        return base
-    n = 2
-    while store.get_publication(f"{base}-{n}") is not None:
-        n += 1
-    return f"{base}-{n}"
+    # A leftover document folder makes an id taken, too (never inherited).
+    return documents.PUBLICATIONS.free_id(
+        base or "veroeffentlichung", lambda i: store.get_publication(i) is not None)
 
 
 def _unique_project_id(store, base: str) -> str:
-    base = base or "projekt"
-    if store.get_project(base) is None:
-        return base
-    n = 2
-    while store.get_project(f"{base}-{n}") is not None:
-        n += 1
-    return f"{base}-{n}"
+    return documents.PROJECTS.free_id(base or "projekt", lambda i: store.get_project(i) is not None)
 
 
 def _manuscript_stem(name: str) -> str:
@@ -331,9 +323,9 @@ def _toggle_checklist_item(body: str, index: int) -> str:
     return "\n".join(out)
 
 
-def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
-    """``llm``/``library`` are the host services from PluginApi (Phase 4).
-    Without them the matching endpoints answer 503 — the rest of Atlas works."""
+def build_router(store, broadcaster, llm=None, library=None, settings=None) -> APIRouter:
+    """``llm``/``library``/``settings`` are host services from PluginApi (Phase 4,
+    #228). Without them the matching endpoints answer 503 — the rest works."""
     router = APIRouter(prefix="/api/plugins/atlas", tags=["atlas"])
 
     def _resolve_citekey_entry(citekey: str) -> dict:
@@ -745,11 +737,8 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
         project = store.get_project(project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
-        # Explicit user action: remove the Markdown file, then the index row.
-        # The project's document subfolder (projekte/<id>/) is left untouched —
-        # it may hold user files; deleting the project only drops its .md.
-        if project.path:
-            Path(project.path).unlink(missing_ok=True)
+        # Explicit user action: documents set aside, .md removed, then the index.
+        remove_entity_files(documents.PROJECTS, project_id, project.path)
         store.delete_project(project_id)
         broadcaster.publish({"type": "projects-changed"})
         return {"deleted": project_id}
@@ -1023,6 +1012,8 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
         publication = store.get_publication(publication_id)
         if publication is None:
             raise HTTPException(status_code=404, detail="Veroeffentlichung nicht gefunden")
+        if publication.collection_id is not None:  # literature lives in the core (ADR-0022)
+            raise HTTPException(status_code=409, detail="error.atlas.collection_refs_readonly")
         seen = set(publication.refs)
         added = []
         for r in payload.refs:
@@ -1081,9 +1072,7 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
         publication = store.get_publication(publication_id)
         if publication is None:
             raise HTTPException(status_code=404, detail="Veroeffentlichung nicht gefunden")
-        # Explicit user action: remove the Markdown file, then the index row.
-        if publication.path:
-            Path(publication.path).unlink(missing_ok=True)
+        remove_entity_files(documents.PUBLICATIONS, publication_id, publication.path)
         store.delete_publication(publication_id)
         broadcaster.publish({"type": "publications-changed"})
         return {"deleted": publication_id}
@@ -1296,7 +1285,8 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
 
     @router.post("/manuscripts/{manuscript_id}/compile")
     async def compile_manuscript(manuscript_id: str):
-        """PDF-Vorschau: Manuskript + Bibliotheks-.bib durch Tectonic (Subprozess)."""
+        """PDF-Vorschau: Manuskript + .bib durch Tectonic (Subprozess) — die
+        .bib der Sammlung bei einem Sammlungs-Eintrag, sonst die Bibliothek."""
         data = _manuscript_or_404(manuscript_id)
         if compiler.find_tectonic() is None:
             raise HTTPException(
@@ -1307,9 +1297,7 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
                     f"{compiler.app_data_binary()} entpacken (oder TECTONIC_PATH setzen)."
                 ),
             )
-        # Hosts vor diesem Vertrag haben kein export_bibtex — dann leere Bibliographie.
-        exporter = getattr(library, "export_bibtex", None) if library else None
-        bibliography = exporter() if exporter else ""
+        bibliography = manuscript_bibliography(store, library, manuscript_id)
         try:
             pdf = await run_in_threadpool(
                 compiler.compile_manuscript, data["content"], bibliography
@@ -1345,4 +1333,5 @@ def build_router(store, broadcaster, llm=None, library=None) -> APIRouter:
     router.include_router(build_journal_router(store, broadcaster))
     router.include_router(build_zettel_router(store, broadcaster))
     router.include_router(build_links_router(store))
+    router.include_router(build_writing_router(store, broadcaster, library, settings))
     return router
