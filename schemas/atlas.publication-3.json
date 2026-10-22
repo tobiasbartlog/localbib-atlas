@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.publication/3",
+  "title": "Atlas Publication Frontmatter",
+  "description": "YAML frontmatter of a Publication (veroeffentlichungen/*.md). Successor of the former Atlas Project entity (atlas.project/1|2) — see ADR-0004. Carries the bibliography (refs as Paper cite keys), the publication lifecycle, links to manuscripts (.tex), originating research projects, derived-from ideas and an optional paper self-link (cite key of the own published PDF in the library). /2 (ADR-0022, issue #205) adds the optional Collection link: a file with collection_id is the Atlas side of a core Collection, its bibliography is that Collection (read live through LibraryApi), so it carries no refs; kind records the entry type (always publication in this folder). /3 adds the optional history (Verlauf): one entry {date, status, venue} per status change, so a rejection and the resubmission elsewhere stay on record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "atlas.publication/3"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "description": "Lifecycle planned → drafting → submitted → in-revision → published, plus terminal rejected/withdrawn.",
+      "enum": [
+        "planned",
+        "drafting",
+        "submitted",
+        "in-revision",
+        "published",
+        "rejected",
+        "withdrawn"
+      ]
+    },
+    "venue": {
+      "type": "string",
+      "description": "Target or actual venue (journal, conference, publisher)."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "journal-article",
+        "conference-paper",
+        "book-chapter",
+        "other"
+      ]
+    },
+    "authors": {
+      "type": "array",
+      "description": "Co-authors as free-text names.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "submitted": {
+      "type": "string",
+      "format": "date"
+    },
+    "published": {
+      "type": "string",
+      "format": "date"
+    },
+    "due": {
+      "type": "string",
+      "format": "date"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "Bibliography as Paper cite keys → join to the LocalBib library. Hanging refs are warnings, never auto-repaired.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "derived_from": {
+      "type": "array",
+      "description": "Idea IDs this publication grew out of (link stored downstream, ADR-0004).",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "manuscripts": {
+      "type": "array",
+      "description": "Linked manuscript .tex names (link, not ownership).",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "projects": {
+      "type": "array",
+      "description": "IDs of the research projects this publication originated from (canonical side of the Project↔Publication link).",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "paper": {
+      "type": "string",
+      "description": "Cite-key self-link to the own published PDF once imported into the library."
+    },
+    "history": {
+      "type": "array",
+      "description": "Verlauf: every status change, oldest first, appended by Atlas on each change; an undo replaces the whole list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "date",
+          "status"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "Day of the change."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "drafting",
+              "submitted",
+              "in-revision",
+              "published",
+              "rejected",
+              "withdrawn"
+            ],
+            "description": "The status entered on that day."
+          },
+          "venue": {
+            "type": "string",
+            "description": "The target (journal, conference, publisher) at that moment."
+          }
+        }
+      },
+      "default": []
+    },
+    "collection_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "ID of the core Collection this entry belongs to (ADR-0022). Its literature list is the Collection, never refs in this file. Removed — and the last membership frozen into refs once — when the Collection is deleted."
+    },
+    "kind": {
+      "const": "publication",
+      "description": "Entry type of a Collection entry; only set together with collection_id. Atlas stores it, the core knows nothing about it."
+    }
+  },
+  "dependentRequired": {
+    "kind": [
+      "collection_id"
+    ]
+  },
+  "if": {
+    "required": [
+      "collection_id"
+    ]
+  },
+  "then": {
+    "not": {
+      "required": [
+        "refs"
+      ]
+    }
+  }
+}

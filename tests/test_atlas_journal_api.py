@@ -170,6 +170,68 @@ def test_editing_an_unknown_task_is_a_404_code(atlas_client):
     assert resp.json()["detail"] == "error.atlas.task_not_found"
 
 
+# --- Notiz: the indented lines under a Task ------------------------------------
+
+def test_a_note_is_written_under_the_task_and_read_back(atlas_client, tmp_path):
+    add_task(atlas_client, "Mail an Betreuer")
+    add_task(atlas_client, "Danach")
+    before = journal_text(tmp_path)
+
+    resp = atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"note": "Fragen:\n- Gliederung 3.2"})
+    assert resp.status_code == 200
+    assert resp.json()["note"] == "Fragen:\n- Gliederung 3.2"
+
+    removed, added = line_diff(before, journal_text(tmp_path))
+    assert removed == [] and added == ["  Fragen:", "  - Gliederung 3.2"]
+    assert "- [ ] Mail an Betreuer\n  Fragen:\n  - Gliederung 3.2\n- [ ] Danach" in journal_text(tmp_path)
+
+    week = atlas_client.get(f"{BASE}/{WEEK}").json()
+    assert [t["note"] for t in week["tasks"]] == ["Fragen:\n- Gliederung 3.2", ""]
+
+
+def test_editing_the_title_keeps_the_note_and_an_empty_note_removes_it(atlas_client, tmp_path):
+    add_task(atlas_client, "Mail")
+    atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"note": "Bleibt"})
+    atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"text": "Mail an Betreuer"})
+    assert "- [ ] Mail an Betreuer\n  Bleibt" in journal_text(tmp_path)
+
+    both = atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"text": "Mail", "note": ""}).json()
+    assert (both["text"], both["note"]) == ("Mail", "")
+    assert "Bleibt" not in journal_text(tmp_path)
+
+
+def test_a_put_without_text_and_note_is_rejected(atlas_client):
+    add_task(atlas_client, "Mail")
+    resp = atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "error.atlas.invalid_request"
+
+
+def test_the_note_travels_with_a_move_and_comes_back_on_undo(atlas_client, tmp_path):
+    add_task(atlas_client, "Kapitel schreiben", day=FRIDAY)
+    atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"note": "Abschnitt 2 zuerst"})
+    before = journal_text(tmp_path)
+
+    moved = atlas_client.post(f"{BASE}/{WEEK}/tasks/0/move", json={"to": NEXT_MONDAY}).json()
+    assert "Abschnitt 2" not in journal_text(tmp_path)
+    assert "- [ ] Kapitel schreiben ←2026-09-25\n  Abschnitt 2 zuerst" in journal_text(tmp_path, NEXT_WEEK)
+    nxt = atlas_client.get(f"{BASE}/{NEXT_WEEK}").json()
+    assert nxt["tasks"][0]["note"] == "Abschnitt 2 zuerst"
+
+    assert _undo(atlas_client, moved).status_code == 200
+    assert journal_text(tmp_path) == before
+    assert "Abschnitt 2" not in journal_text(tmp_path, NEXT_WEEK)
+
+
+def test_deleting_a_task_takes_its_note_along(atlas_client, tmp_path):
+    add_task(atlas_client, "Erster")
+    add_task(atlas_client, "Zweiter")
+    atlas_client.put(f"{BASE}/{WEEK}/tasks/0", json={"note": "weg"})
+    atlas_client.delete(f"{BASE}/{WEEK}/tasks/0")
+    text = journal_text(tmp_path)
+    assert "weg" not in text and "Erster" not in text and "- [ ] Zweiter" in text
+
+
 # --- Uebertrag ----------------------------------------------------------------
 
 def test_move_marks_the_source_and_appends_the_target(atlas_client, tmp_path):

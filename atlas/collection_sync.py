@@ -31,6 +31,7 @@ except ImportError:  # a host before contract 2.1 — it never sends these event
 
 from atlas import collection_entries
 from atlas.domain import Project
+from atlas.entity_store import FileChanged
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,9 @@ DEBOUNCE_SECONDS = 0.4
 
 def reconcile_tombstones(store, source) -> list[str]:
     """Freeze every Collection-linked file whose Collection is deleted.
-    Returns the ids of the converted files (empty on a second pass)."""
+    Returns the ids of the converted files (empty on a second pass). A file
+    with a hand edit the index has not read is skipped (logged) and the rest
+    converted; it follows on a later pass, once the edit is read."""
     if source is None or not source.available:
         return []
     converted: list[str] = []
@@ -48,10 +51,15 @@ def reconcile_tombstones(store, source) -> list[str]:
         if not collection or not collection.get("deleted"):
             continue
         frozen = collection_entries.freeze(entity, collection, source.refs(entity.collection_id))
-        if isinstance(frozen, Project):
-            store.index_project_file(store.save_project_file(frozen))
-        else:
-            store.index_publication_file(store.save_publication_file(frozen))
+        try:
+            if isinstance(frozen, Project):
+                store.index_project_file(store.save_project_file(frozen))
+            else:
+                store.index_publication_file(store.save_publication_file(frozen))
+        except FileChanged as exc:
+            logger.warning("Atlas: %s nicht eingefroren, Hand-Edit noch nicht eingelesen: %s",
+                           exc.file, exc.reason)
+            continue
         converted.append(frozen.id)
         logger.info(
             "Atlas: Sammlung %s geloescht — %s ist jetzt ein normaler Eintrag "

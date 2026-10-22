@@ -38,7 +38,7 @@ def test_plan_converts_legacy_v1_and_v2_to_valid_publications():
     for action in plan.actions:
         pub = Publication.from_markdown(action.content)
         assert pub.validate() == []
-        assert "schema: atlas.publication/2" in action.content
+        assert "schema: atlas.publication/3" in action.content
 
 
 def test_plan_carries_all_legacy_fields_over():
@@ -111,6 +111,16 @@ def test_plan_renames_on_id_collision_with_existing_publication():
     assert action.target_name == "doppelt-3.md"
     assert Publication.from_markdown(action.content).id == "doppelt-3"
     assert any("kollidiert" in w for w in plan.warnings)
+
+
+def test_plan_counts_an_existing_name_in_another_case_as_taken():
+    """Windows/macOS file names ignore case: ``foo.md`` would open and
+    truncate a hand-named ``Foo.md`` (review 2026-10-18)."""
+    plan = plan_migration(
+        [("a.md", _legacy_md(pid="foo")), ("b.md", _legacy_md(pid="FOO-2"))], {"Foo"}
+    )
+    assert [a.target_name for a in plan.actions] == ["foo-2.md", "FOO-2-2.md"]
+    assert sum("kollidiert" in w for w in plan.warnings) == 2
 
 
 def test_plan_is_idempotent_after_apply():

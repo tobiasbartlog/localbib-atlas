@@ -16,6 +16,11 @@ source kind) already lives in ``AtlasStore.backlinks``/``AtlasStore.entities``
 Rueckverweis to a deleted entity is exactly the interesting case, so the
 caller learns "dangling" from ``exists: false``, not from an error) and the
 ``q`` substring filter on entities (id or title, case-insensitive).
+
+``POST /entities/{kind}/{id}/open`` and ``…/reveal`` hand an entity's own
+Markdown file to the system (open it in the default app / show it selected in
+the file manager) — the "⋯" menu of every detail page. Explicit user actions,
+nothing is read or written; ids are only unique per kind, hence the kind.
 """
 
 from __future__ import annotations
@@ -24,7 +29,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+
+from atlas import documents
+
+ERR_ENTITY_NOT_FOUND = "error.atlas.entity_not_found"
+ERR_KIND_INVALID = "error.atlas.kind_invalid"
 
 
 def chapter_metrics(store, node) -> dict:
@@ -100,5 +110,33 @@ def build_links_router(store) -> APIRouter:
             ]
         items = sorted(items, key=lambda e: (e["title"] or "").lower())
         return {"entities": items}
+
+    getters = {
+        "publication": store.get_publication,
+        "project": store.get_project,
+        "idea": store.get_idea,
+        "diss_node": store.get_node,
+        "zettel": store.get_zettel,
+    }
+
+    def _entity_file(kind: str, entity_id: str) -> Path:
+        getter = getters.get(kind)
+        if getter is None:
+            raise HTTPException(status_code=422, detail=ERR_KIND_INVALID)
+        entity = getter(entity_id)
+        path = Path(entity.path) if entity is not None and entity.path else None
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail=ERR_ENTITY_NOT_FOUND)
+        return path
+
+    @router.post("/entities/{kind}/{entity_id}/open")
+    async def open_entity_file(kind: str, entity_id: str):
+        documents.open_in_viewer(_entity_file(kind, entity_id))
+        return {"status": "ok"}
+
+    @router.post("/entities/{kind}/{entity_id}/reveal")
+    async def reveal_entity_file(kind: str, entity_id: str):
+        documents.reveal_in_folder(_entity_file(kind, entity_id))
+        return {"status": "ok"}
 
     return router

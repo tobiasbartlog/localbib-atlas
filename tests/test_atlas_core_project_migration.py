@@ -60,7 +60,7 @@ def test_plan_creates_one_research_project_per_core_project():
     assert fgc.status == "active"
     assert fgc.refs == ["Smith2020", "Doe2021"]
     assert fgc.body == "Foerderprojekt."
-    assert "schema: atlas.project/4" in plan.actions[0].content
+    assert "schema: atlas.project/5" in plan.actions[0].content
 
     empty = Project.from_markdown(plan.actions[1].content, id_hint="leseliste")
     assert empty.validate() == []
@@ -82,6 +82,14 @@ def test_plan_renames_on_collision_with_existing_atlas_project():
     action = plan.actions[0]
     assert action.target_name == "fgc-robotik-3.md"
     assert Project.from_markdown(action.content, id_hint="x").id == "fgc-robotik-3"
+    assert any("kollidiert" in w for w in plan.warnings)
+
+
+def test_plan_counts_an_existing_name_in_another_case_as_taken():
+    """Windows/macOS file names ignore case: ``vorhaben.md`` would open and
+    truncate the hand-named ``Vorhaben.md`` (review 2026-10-18)."""
+    plan = plan_core_project_migration([_core(1, "Vorhaben")], {"Vorhaben"})
+    assert plan.actions[0].target_name == "vorhaben-2.md"
     assert any("kollidiert" in w for w in plan.warnings)
 
 
@@ -126,6 +134,17 @@ def atlas_dir(tmp_path, monkeypatch):
 
 def _backups(base):
     return sorted(base.parent.glob(f"{base.name}-backup-*"))
+
+
+def test_executor_never_overwrites_a_hand_named_file_in_another_case(atlas_dir):
+    hand = config.projects_dir() / "Vorhaben.md"
+    hand.write_text("---\ntitle: Vorhaben\n---\n\nMEINE HANDNOTIZEN\n", encoding="utf-8")
+    before = hand.read_bytes()
+
+    report = migrate_core_projects(_FakeLibrary([_core(1, "Vorhaben")]))
+
+    assert [m["file"] for m in report["mappings"]] == ["vorhaben-2.md"]
+    assert hand.read_bytes() == before
 
 
 def test_executor_writes_projects_backup_and_marker(atlas_dir):

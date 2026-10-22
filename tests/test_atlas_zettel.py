@@ -8,7 +8,6 @@ from atlas.zettel import (
     Zettel,
     make_zettel_id,
     new_zettel,
-    unique_zettel_id,
 )
 
 
@@ -51,13 +50,6 @@ def test_new_zettel_needs_only_a_title():
 
 def test_make_zettel_id_follows_the_idea_pattern():
     assert make_zettel_id("Grüße & Anker", today=date(2026, 1, 5)) == "2026-01-05-grüße-anker"
-
-
-def test_unique_zettel_id_suffixes_on_collision():
-    base = "2026-09-23-gedanke"
-    assert unique_zettel_id(base, []) == base
-    assert unique_zettel_id(base, [base]) == f"{base}-2"
-    assert unique_zettel_id(base, [base, f"{base}-2"]) == f"{base}-3"
 
 
 def test_validate_rejects_an_unknown_type():

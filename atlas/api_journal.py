@@ -15,7 +15,12 @@ so both paths look identical to the client.
 
 **Errors are codes, never sentences** (issue #180, ADR-0018): the store raises
 German ``ValueError``/``KeyError`` for a human reading a traceback; this module
-translates them into ``error.atlas.*`` for the SPA's catalog.
+translates them into ``error.atlas.*`` for the SPA's catalog. A week file a
+hand edit broke (``journal_store.WeekUnreadable``) is ``409`` with
+``{code: error.atlas.week_unreadable, params: {week, file}}`` wherever that
+week is needed whole — every write refuses before it writes; ``/today`` and
+``carry-over``, which only need it next to other weeks, skip it and name it in
+``unreadable``. A locked week file is ``423 error.atlas.document_locked``.
 
 Route order matters: ``/journal/today`` and ``/journal/tasks`` are declared
 before ``/journal/{week}``, otherwise the week parameter would swallow them.
@@ -31,7 +36,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from atlas import agenda, documents, journal_store
-from atlas.journal import MAX_GOALS, MoveChanged, goals_progress
+from atlas.index_links import KIND_ZETTEL
+from atlas.journal import MAX_GOALS, Journal, MoveChanged, goals_progress
 from atlas.weeks import (
     as_date,
     is_week_id,
@@ -43,7 +49,7 @@ from atlas.weeks import (
     week_number,
     weekday_name,
 )
-from atlas.zettel import new_zettel, unique_zettel_id
+from atlas.zettel import new_zettel
 
 # Error codes — the SPA resolves them, the backend never translates.
 ERR_WEEK_INVALID = "error.atlas.week_invalid"
@@ -56,6 +62,10 @@ ERR_GOALS_TOO_MANY = "error.atlas.goals_too_many"
 ERR_GOAL_TITLE_REQUIRED = "error.atlas.goal_title_required"
 ERR_INVALID_REQUEST = "error.atlas.invalid_request"
 ERR_MOVE_CHANGED = "error.atlas.move_changed"
+# A week file held by OneDrive or an editor — the code the document folders use.
+ERR_DOCUMENT_LOCKED = "error.atlas.document_locked"
+# A week file whose frontmatter does not parse (hand edit) — with {week, file}.
+ERR_WEEK_UNREADABLE = "error.atlas.week_unreadable"
 
 NEWEST_ZETTEL = 5  # how many Zettel the Heute page shows (story 18)
 
@@ -70,7 +80,10 @@ class TaskCreate(BaseModel):
 
 
 class TaskText(BaseModel):
-    text: str
+    """At least one of them: the Task line and/or its Notiz ("" removes it)."""
+
+    text: Optional[str] = None
+    note: Optional[str] = None
 
 
 class TaskMove(BaseModel):
@@ -126,14 +139,50 @@ def _day_or_422(value) -> date:
         raise HTTPException(status_code=422, detail=ERR_DATE_INVALID)
 
 
-def _guard(call):
-    """Run a store write and map its German exceptions to error codes."""
+def _unreadable(exc: journal_store.WeekUnreadable) -> dict:
+    """``{week, file}`` of a week file that does not parse — ``file`` as the
+    user finds it in the Atlas folder (``journal/<week>.md``)."""
+    return {"week": exc.week, "file": exc.file}
+
+
+def _guard(call, not_found: str = ERR_TASK_NOT_FOUND):
+    """Run a store call on week files and map its German exceptions to error
+    codes. A week file that does not parse is 409 naming it, a locked one
+    423 — either way the store left the files as they were."""
     try:
         return call()
+    except journal_store.WeekUnreadable as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": ERR_WEEK_UNREADABLE, "params": _unreadable(exc)}
+        )
+    except MoveChanged:
+        raise HTTPException(status_code=409, detail=ERR_MOVE_CHANGED)
     except KeyError:
-        raise HTTPException(status_code=404, detail=ERR_TASK_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=not_found)
     except ValueError:
         raise HTTPException(status_code=422, detail=ERR_INVALID_REQUEST)
+    except OSError:
+        raise HTTPException(status_code=423, detail=ERR_DOCUMENT_LOCKED)
+
+
+def _read(store, week: str):
+    """A week the handler needs whole — to show it, or to write from it."""
+    return _guard(lambda: store.read_journal(week))
+
+
+def _read_or_skip(store, week: str, skipped: list[dict]):
+    """A week a request only needs next to others (Heute, the sources of
+    carry-over): a file that does not parse is named in ``skipped`` and reads
+    as an empty week, so the rest still answers. Nothing is written from it."""
+
+    def read():
+        try:
+            return store.read_journal(week)
+        except journal_store.WeekUnreadable as exc:
+            skipped.append(_unreadable(exc))
+            return Journal(week=week)
+
+    return _guard(read)
 
 
 def _task(week: str, task: dict) -> dict:
@@ -151,6 +200,8 @@ def _task(week: str, task: dict) -> dict:
         "tags": list(task.get("tags") or []),
         "moved_to": task.get("moved_to"),
         "moved_from": task.get("moved_from"),
+        # Only the week file knows the Notiz; an index row answers "".
+        "note": task.get("note") or "",
     }
 
 
@@ -218,7 +269,7 @@ def _review_of(store, week: str, journal) -> dict:
 def _week_payload(store, week: str) -> dict:
     """The whole week: goals with progress, all seven days (empty ones
     included, so the SPA can render columns) and the derived Rueckblick."""
-    journal = store.read_journal(week)
+    journal = _read(store, week)
     tasks = _tasks_of(journal)
     by_day: dict[str, list[dict]] = {}
     for task in tasks:
@@ -316,18 +367,22 @@ def build_journal_router(store, broadcaster) -> APIRouter:
 
     @router.get("/today")
     async def today():
-        """The Heute page. Creates no file — a week without Tasks is empty."""
+        """The Heute page. Creates no file — a week without Tasks is empty.
+        A week file that does not parse (this week or the previous one) is
+        left out and named in ``unreadable``; the rest of the page still
+        loads."""
         day = _today()
         iso = day.isoformat()
         week = week_id(day)
-        journal = store.read_journal(week)
+        unreadable: list[dict] = []
+        journal = _read_or_skip(store, week, unreadable)
         tasks = _tasks_of(journal)
         todays = [t for t in tasks if t["day"] == iso]
 
         # "Offen von Vortagen" (story 11) spans this week and the previous one;
         # a moved (→) or done Task is not open.
         earlier = agenda.open_tasks_before(
-            _tasks_of(store.read_journal(previous_week(week))) + tasks, day
+            _tasks_of(_read_or_skip(store, previous_week(week), unreadable)) + tasks, day
         )
 
         return {
@@ -347,6 +402,7 @@ def build_journal_router(store, broadcaster) -> APIRouter:
             "zettel": [_zettel_row(z) for z in store.list_zettel()[:NEWEST_ZETTEL]],
             # The nav badge (story 57): today plus everything still hanging.
             "open_count": sum(1 for t in todays if t["open"]) + len(earlier),
+            "unreadable": unreadable,
         }
 
     @router.get("/tasks")
@@ -375,17 +431,21 @@ def build_journal_router(store, broadcaster) -> APIRouter:
         text = (payload.text or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail=ERR_TASK_TEXT_REQUIRED)
-        created = store.add_task(week, day.isoformat(), text)
+        created = _guard(lambda: store.add_task(week, day.isoformat(), text))
         _changed()
         return _task(week, created)
 
     @router.put("/{week}/tasks/{body_index}")
     async def update_task(week: str, body_index: int, payload: TaskText):
+        """Edit the Task line (``text``) and/or its Notiz (``note``) — the
+        indented lines under it; every other line stays byte-identical."""
         _week_or_404(week)
-        text = (payload.text or "").strip()
-        if not text:
+        if payload.text is None and payload.note is None:
+            raise HTTPException(status_code=422, detail=ERR_INVALID_REQUEST)
+        text = None if payload.text is None else payload.text.strip()
+        if text == "":
             raise HTTPException(status_code=400, detail=ERR_TASK_TEXT_REQUIRED)
-        updated = _guard(lambda: store.update_task(week, body_index, text))
+        updated = _guard(lambda: store.update_task(week, body_index, text, payload.note))
         _changed()
         return _task(week, updated)
 
@@ -422,14 +482,9 @@ def build_journal_router(store, broadcaster) -> APIRouter:
         edited since — the UI then advises moving the Task back instead."""
         _week_or_404(week)
         _week_or_404(payload.to_week)
-        try:
-            result = store.undo_move(week, body_index, payload.to_week, payload.to_index)
-        except MoveChanged:
-            raise HTTPException(status_code=409, detail=ERR_MOVE_CHANGED)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=ERR_TASK_NOT_FOUND)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=ERR_INVALID_REQUEST)
+        result = _guard(
+            lambda: store.undo_move(week, body_index, payload.to_week, payload.to_index)
+        )
         _changed()
         return result
 
@@ -443,31 +498,40 @@ def build_journal_router(store, broadcaster) -> APIRouter:
     @router.post("/{week}/carry-over")
     async def carry_over(week: str, payload: CarryOver):
         """Carry every open Task of the earlier days (this week and the one
-        before) to ``to`` — story 12, "alle auf einmal"."""
+        before) to ``to`` — story 12, "alle auf einmal". A source week whose
+        file does not parse is skipped and named in ``unreadable`` (its Tasks
+        stay, its file is not written); a target week that does not parse
+        refuses the whole carry-over with 409."""
         _week_or_404(week)
         to = _day_or_422(payload.to)
         iso = to.isoformat()
 
-        def _pending(source_week: str) -> list[dict]:
-            return [
-                t
-                for t in store.read_journal(source_week).tasks
-                if t["open"] and t["day"] and t["day"] < iso
-            ]
+        def _pending(journal) -> list[dict]:
+            return [t for t in journal.tasks if t["open"] and t["day"] and t["day"] < iso]
 
         moved: list[dict] = []
-        for source_week in (previous_week(week), week):
-            # body_index is position-dependent (ADR-0020), so every Uebertrag
-            # re-reads the file instead of trusting a remembered list. Bounded
-            # by the initial count: a moved line is no longer open.
-            for _ in range(len(_pending(source_week))):
-                rest = _pending(source_week)
-                if not rest:
-                    break
-                moved.append(store.move_task(source_week, rest[0]["body_index"], iso))
-        if moved:
-            _changed()
-        return {"to": iso, "week": week_id(to), "moved": len(moved), "tasks": moved}
+        skipped: list[dict] = []
+        try:
+            for source_week in (previous_week(week), week):
+                # body_index is position-dependent (ADR-0020), so every Uebertrag
+                # re-reads the file instead of trusting a remembered list. Bounded
+                # by the initial count: a moved line is no longer open.
+                for _ in range(len(_pending(_read_or_skip(store, source_week, skipped)))):
+                    rest = _pending(_read(store, source_week))
+                    if not rest:
+                        break
+                    moved.append(_guard(
+                        lambda: store.move_task(source_week, rest[0]["body_index"], iso)
+                    ))
+        finally:
+            # Every way out — done, or a later week locked/unreadable (the
+            # ones before stay moved) — announces what was moved, once.
+            if moved:
+                _changed()
+        return {
+            "to": iso, "week": week_id(to), "moved": len(moved), "tasks": moved,
+            "unreadable": skipped,
+        }
 
     # --- Wochenziele ---------------------------------------------------------
 
@@ -484,10 +548,12 @@ def build_journal_router(store, broadcaster) -> APIRouter:
     @router.post("/{week}/goals/adopt")
     async def adopt_goals(week: str):
         """Append the previous week's *open* goals (story 29). Titles already
-        present stay single, and the maximum of five still holds."""
+        present stay single, and the maximum of five still holds. Either week
+        file not parsing is 409 naming it — there is nothing to adopt from
+        the one, and nothing may be written into the other."""
         _week_or_404(week)
-        current = store.read_journal(week)
-        prior = store.read_journal(previous_week(week))
+        current = _read(store, week)
+        prior = _read(store, previous_week(week))
         taken = {str(g.get("title") or "").strip().lower() for g in current.goals}
         adopted = []
         for goal in prior.goals:
@@ -504,10 +570,7 @@ def build_journal_router(store, broadcaster) -> APIRouter:
     @router.post("/{week}/goals/{index}/toggle")
     async def toggle_goal(week: str, index: int):
         _week_or_404(week)
-        try:
-            journal = store.toggle_goal(week, index)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=ERR_GOAL_NOT_FOUND)
+        journal = _guard(lambda: store.toggle_goal(week, index), not_found=ERR_GOAL_NOT_FOUND)
         _changed()
         return _goals_payload(journal)
 
@@ -516,9 +579,10 @@ def build_journal_router(store, broadcaster) -> APIRouter:
     @router.post("/{week}/review/zettel")
     async def review_zettel(week: str):
         """Hold the derived Rueckblick as a Zettel of type ``review``
-        (story 33) — it is a normal Zettel afterwards, editable and linkable."""
+        (story 33) — it is a normal Zettel afterwards, editable and linkable.
+        A week file that does not parse is 409: its numbers would be wrong."""
         _week_or_404(week)
-        journal = store.read_journal(week)
+        journal = _read(store, week)
         data = _review_of(store, week, journal)
 
         # The Zettel belongs to the week it reviews: today when today is in it,
@@ -533,7 +597,7 @@ def build_journal_router(store, broadcaster) -> APIRouter:
             type="review",
             body=_review_markdown(week, data),
         )
-        zettel.id = unique_zettel_id(zettel.id, [z.id for z in store.list_zettel()])
+        zettel.id = store.free_id(KIND_ZETTEL, zettel.id)
         path = store.save_zettel_file(zettel)
         store.index_zettel_file(path)
         _changed("zettel")
@@ -543,11 +607,13 @@ def build_journal_router(store, broadcaster) -> APIRouter:
     @router.post("/{week}/open")
     async def open_week_file(week: str):
         """Open the week's Journal in the system editor (story 19). A week
-        without a file gets one first — you cannot edit what is not there."""
+        without a file gets one first — you cannot edit what is not there. An
+        existing file is handed over as it is, without reading it: this is how
+        a week file that does not parse gets fixed."""
         _week_or_404(week)
         path = journal_store.journal_path(week)
         if not path.exists():
-            store.write_journal(store.read_journal(week))
+            _guard(lambda: store.write_journal(store.read_journal(week)))
             store.index_journal_file(path)
             _changed()
         documents.open_in_viewer(path)

@@ -18,14 +18,17 @@ Imports only stdlib + Atlas submodules (P3). The public functions take a
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from atlas import config, index_links, journal as journal_mod
+from atlas import config, entity_store, index_links, journal as journal_mod
 from atlas.journal import MAX_GOALS, Journal, normalize_goal
 from atlas.weeks import as_date, is_week_id, week_contains, week_id
+
+logger = logging.getLogger(__name__)
 
 Connect = Callable[[], sqlite3.Connection]
 
@@ -57,6 +60,27 @@ CREATE INDEX IF NOT EXISTS journal_tasks_day ON journal_tasks (day);
 
 # --- files -------------------------------------------------------------------
 
+class WeekUnreadable(Exception):
+    """A week file that exists but does not parse — YAML a hand edit broke
+    (``- title: Kapitel 3: Methodik`` without quotes), no mapping, not UTF-8.
+
+    Every write reads its week(s) first and stops here, before it writes
+    anything: rewriting a file Atlas cannot read would destroy the user's
+    edit (P1). The API answers 409 ``error.atlas.week_unreadable`` naming
+    :attr:`file`; a lock stays an ``OSError`` (423)."""
+
+    def __init__(self, week: str, path: Path, reason: str) -> None:
+        super().__init__(f"{path}: {reason}")
+        self.week = week
+        self.path = Path(path)
+        self.reason = reason
+
+    @property
+    def file(self) -> str:
+        """The file as the user finds it in the Atlas folder: ``journal/<week>.md``."""
+        return f"{self.path.parent.name}/{self.path.name}"
+
+
 def journal_path(week: str) -> Path:
     """``journal/<week>.md`` — the file of one ISO week (may not exist)."""
     return config.journal_dir() / f"{ensure_week(week)}.md"
@@ -70,11 +94,23 @@ def ensure_week(week: str) -> str:
 
 def read_journal(week: str) -> Journal:
     """The week's Journal. A missing file yields an **empty** Journal with
-    ``path = None``; reading never creates a file."""
+    ``path = None``; reading never creates a file. A file that does not parse
+    raises :class:`WeekUnreadable` — never an empty Journal, which the next
+    write would put over the user's edit. So does a file whose ``week:``
+    names another week (last week's file copied as a template): every write
+    goes to ``journal_path(journal.week)`` and would overwrite that week."""
     path = journal_path(week)
     if not path.exists():
         return Journal(week=week)
-    return Journal.from_file(path)
+    try:
+        journal = Journal.from_file(path)
+    except OSError:
+        raise  # a lock: the caller answers 423 and retries later
+    except Exception as exc:  # noqa: BLE001 - whatever does not parse is unreadable
+        raise WeekUnreadable(week, path, str(exc)) from exc
+    if journal.week != week:
+        raise WeekUnreadable(week, path, f"week im Kopf ({journal.week}) passt nicht zum Dateinamen")
+    return journal
 
 
 def write_journal(journal: Journal) -> Path:
@@ -173,7 +209,10 @@ def remove_path(conn: sqlite3.Connection, path) -> None:
 
 def reindex_journals(connect: Connect) -> dict:
     """Full rebuild of ``journal_weeks``/``journal_tasks`` and the Task edges
-    from ``journal/*.md`` (P1: atlas.db stays disposable)."""
+    from ``journal/*.md`` (P1: atlas.db stays disposable). A week file that
+    cannot be read counts as invalid and is named in ``unreadable``, the other
+    weeks are indexed all the same; a lock is retried first, a database
+    failure goes up (:func:`entity_store.index_or_skip`)."""
     directory = config.journal_dir()
     files = sorted(directory.glob("*.md")) if directory.exists() else []
     with closing(connect()) as conn:
@@ -184,11 +223,14 @@ def reindex_journals(connect: Connect) -> dict:
         )
         conn.commit()
     invalid = 0
+    unreadable: list[dict] = []
     for path in files:
-        journal = index_journal_file(connect, path)
-        if journal.validate():
+        journal = entity_store.index_or_skip(
+            path, lambda p: index_journal_file(connect, p), unreadable
+        )
+        if journal is None or journal.validate():
             invalid += 1
-    return {"count": len(files), "invalid": invalid}
+    return {"count": len(files), "invalid": invalid, "unreadable": unreadable}
 
 
 # --- reads -------------------------------------------------------------------
@@ -300,9 +342,22 @@ def add_task(connect: Connect, week: str, day, text: str) -> dict:
     return _task_result(journal, body_index)
 
 
-def update_task(connect: Connect, week: str, body_index: int, text: str) -> dict:
+def update_task(
+    connect: Connect,
+    week: str,
+    body_index: int,
+    text: Optional[str] = None,
+    note: Optional[str] = None,
+) -> dict:
+    """Edit the Task line (``text``) and/or its Notiz (``note``, empty removes
+    it) in one write; ``None`` leaves that part alone."""
     journal = read_journal(week)
-    journal.body = journal_mod.replace_task(journal.body, body_index, text)
+    body = journal.body
+    if text is not None:
+        body = journal_mod.replace_task(body, body_index, text)
+    if note is not None:
+        body = journal_mod.set_note(body, body_index, note)
+    journal.body = body
     _persist(connect, journal)
     return _task_result(journal, body_index)
 
@@ -327,10 +382,59 @@ def reorder_task(connect: Connect, week: str, body_index: int, position: int) ->
     return {"week": journal.week, "tasks": journal.tasks}
 
 
+def _persist_pair(connect: Connect, first: Journal, second: Journal) -> None:
+    """Write the two week files of a cross-week Uebertrag (ADR-0020) so that
+    the Task is open in at least one of them at every moment: ``first`` is
+    the write that leaves it open (move: the carried line; undo: the source
+    without its ``→``). When ``second`` cannot be written (a lock), ``first``
+    gets its exact previous bytes back and the error goes up. The index is
+    written after both files, so a taken-back write never reached it."""
+    path = journal_path(first.week)
+    before = path.read_bytes() if path.exists() else None
+    write_journal(first)
+    try:
+        write_journal(second)
+    except Exception:
+        _take_back(connect, path, before, first)
+        raise
+    with closing(connect()) as conn:
+        index_journal(conn, first)
+        index_journal(conn, second)
+        conn.commit()
+
+
+def _take_back(connect: Connect, path: Path, before: Optional[bytes], written: Journal) -> None:
+    """Undo the first write of :func:`_persist_pair`. A week file that did not
+    exist before is removed again: it is no file of the user's but the one
+    this same operation created a moment ago, under the store's write lock,
+    holding only the carried line — and a missing week reads as the empty
+    Journal anyway. It goes only while it still holds exactly that. When the
+    take-back fails it is logged and the index follows the file as it
+    stands: the Task is then open in both weeks — twice, never lost."""
+    try:
+        if before is not None:
+            path.write_bytes(before)
+            return
+        if path.read_text(encoding="utf-8") == written.to_markdown():
+            path.unlink()
+            return
+        reason = "seither geaendert"
+    except OSError as exc:
+        reason = str(exc)
+    logger.error(
+        "Atlas: %s nach gescheitertem Uebertrag nicht zurueckgesetzt (%s) — "
+        "die Aufgabe steht in beiden Wochen offen", path, reason,
+    )
+    with closing(connect()) as conn:
+        index_journal(conn, written)
+        conn.commit()
+
+
 def move_task(connect: Connect, week: str, body_index: int, to_day) -> dict:
     """Uebertrag: mark the source line with ``→`` and carry the Task to
     ``to_day`` with ``←``. A target in another week writes (and creates) that
-    week's file too — the two-file case of ADR-0020."""
+    week's file too — the two-file case of ADR-0020: the carried line first,
+    then the ``→`` (:func:`_persist_pair`), so a lock never loses the Task."""
     iso = as_date(to_day).isoformat()
     source = read_journal(ensure_week(week))
     target_week = week_id(iso)
@@ -341,10 +445,11 @@ def move_task(connect: Connect, week: str, body_index: int, to_day) -> dict:
         source.body, body_index, iso, target_body=None if same_week else target.body
     )
     source.body = result.source_body
-    _persist(connect, source)
-    if not same_week:
+    if same_week:
+        _persist(connect, source)
+    else:
         target.body = result.target_body
-        _persist(connect, target)
+        _persist_pair(connect, target, source)
     return {
         "week": target.week,
         "day": result.target_day,
@@ -357,7 +462,9 @@ def move_task(connect: Connect, week: str, body_index: int, to_day) -> dict:
 def undo_move(connect: Connect, week: str, body_index: int, to_week: str, to_index: int) -> dict:
     """"Übertrag zurücknehmen" (#224): the inverse of :func:`move_task` as a
     line operation on one or both week files (ADR-0020). ``week``/``body_index``
-    is the source line, ``to_week``/``to_index`` the carried one."""
+    is the source line, ``to_week``/``to_index`` the carried one. Across weeks
+    the source is opened again first, then the ``←`` line goes
+    (:func:`_persist_pair`)."""
     source = read_journal(ensure_week(week))
     same_week = ensure_week(to_week) == source.week
     target = source if same_week else read_journal(to_week)
@@ -365,10 +472,11 @@ def undo_move(connect: Connect, week: str, body_index: int, to_week: str, to_ind
         source.body, body_index, to_index, target_body=None if same_week else target.body
     )
     source.body = result.source_body
-    _persist(connect, source)
-    if not same_week:
+    if same_week:
+        _persist(connect, source)
+    else:
         target.body = result.target_body
-        _persist(connect, target)
+        _persist_pair(connect, source, target)
     return {"week": source.week, "body_index": result.source_index}
 
 

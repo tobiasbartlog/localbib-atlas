@@ -29,6 +29,14 @@ def test_parse_frontmatter_without_frontmatter():
     assert body == "just a body"
 
 
+def test_parse_frontmatter_reads_a_file_saved_with_a_bom():
+    """"UTF-8 mit BOM" puts U+FEFF in front of ``---`` (review 2026-10-18)."""
+    fm, body = parse_frontmatter("\ufeff---\nid: x\ntitle: Hello\n---\n\nBody text\n")
+    assert fm == {"id": "x", "title": "Hello"}
+    assert body.strip() == "Body text"
+    assert Idea.from_markdown("\ufeff---\nid: x\ntitle: Hello\n---\n").title == "Hello"
+
+
 def test_parse_frontmatter_rejects_non_mapping():
     with pytest.raises(ValueError):
         parse_frontmatter("---\n- a\n- b\n---\n")

@@ -19,7 +19,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
-from atlas import collection_entries, config, entity_store, index_links, journal_store
+from atlas import collection_entries, config, documents, entity_store, index_links, journal_store
 from atlas.domain import (
     DissNode,
     Idea,
@@ -29,7 +29,7 @@ from atlas.domain import (
     normalize_milestone,
 )
 from atlas.journal import Journal
-from atlas.links import extract_wikilinks
+from atlas.links import cites, extract_wikilinks
 from atlas.zettel import Zettel
 
 _SCHEMA = """
@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS projects (
     tags         TEXT NOT NULL DEFAULT '[]',
     refs         TEXT NOT NULL DEFAULT '[]',
     milestones   TEXT NOT NULL DEFAULT '[]',
+    history      TEXT NOT NULL DEFAULT '[]',
     collection_id INTEGER,
     kind         TEXT,
     body         TEXT NOT NULL DEFAULT '',
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS publications (
     manuscripts  TEXT NOT NULL DEFAULT '[]',
     projects     TEXT NOT NULL DEFAULT '[]',
     paper        TEXT,
+    history      TEXT NOT NULL DEFAULT '[]',
     collection_id INTEGER,
     kind         TEXT,
     body         TEXT NOT NULL DEFAULT '',
@@ -175,14 +177,15 @@ class AtlasStore:
                 for row in conn.execute("PRAGMA table_info(projects)").fetchall()
             }
             # atlas.project/4 + atlas.publication/2 (ADR-0022) add the
-            # Collection link columns — same rule: drop, reindex rebuilds.
-            if columns and ("milestones" not in columns or "collection_id" not in columns):
+            # Collection link columns, project/5 + publication/3 the Verlauf
+            # (history) — same rule: drop, reindex rebuilds.
+            if columns and not {"milestones", "collection_id", "history"} <= columns:
                 conn.execute("DROP TABLE projects")
             pub_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(publications)").fetchall()
             }
-            if pub_columns and "collection_id" not in pub_columns:
+            if pub_columns and not {"collection_id", "history"} <= pub_columns:
                 conn.execute("DROP TABLE publications")
             # atlas.dissnode/3 (issue #57, ADR-0005) flattens diss_nodes: kind
             # and parent are gone. Derived index — drop the old layout and let
@@ -295,10 +298,15 @@ class AtlasStore:
     def links_for(self, citekey: str) -> list[Idea]:
         """Ideas that reference ``citekey`` (backward resolution for the library
         reference panel, Abschn. 7). Exact citekey match against each idea's
-        refs. refs are stored as a JSON array, so we filter in Python."""
+        refs or a ``[@key]`` in its body (ADR-0026). refs are stored as a
+        JSON array, so we filter in Python."""
         if not citekey:
             return []
-        return [idea for idea in self.list_ideas() if citekey in idea.refs]
+        return [i for i in self.list_ideas() if citekey in i.refs or cites(i.body, citekey)]
+
+    def nodes_for_citekey(self, citekey: str) -> list[DissNode]:
+        """Chapters whose Skizze cites ``citekey`` as ``[@key]`` (ADR-0026)."""
+        return [n for n in self.list_nodes() if cites(n.body, citekey)]
 
     # --- dissertation nodes -------------------------------------------------
     def index_node(self, node: DissNode) -> None:
@@ -368,7 +376,7 @@ class AtlasStore:
 
     @_serialized
     def save_node_file(self, node: DissNode) -> Path:
-        return entity_store.save_file(_DISS_SPEC, node)
+        return entity_store.save_file(_DISS_SPEC, node, self._connect)
 
     def delete_node(self, node_id: str) -> None:
         self._delete_entity(_DISS_SPEC, index_links.KIND_DISS_NODE, node_id)
@@ -388,15 +396,15 @@ class AtlasStore:
             conn.execute(
                 """INSERT INTO projects
                    (id, title, status, start, "end", funder, grant_id, role,
-                    tags, refs, milestones, collection_id, kind, body, path,
+                    tags, refs, milestones, history, collection_id, kind, body, path,
                     content_hash, valid, errors)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                      title=excluded.title, status=excluded.status,
                      start=excluded.start, "end"=excluded."end",
                      funder=excluded.funder, grant_id=excluded.grant_id,
                      role=excluded.role, tags=excluded.tags, refs=excluded.refs,
-                     milestones=excluded.milestones,
+                     milestones=excluded.milestones, history=excluded.history,
                      collection_id=excluded.collection_id, kind=excluded.kind,
                      body=excluded.body, path=excluded.path,
                      content_hash=excluded.content_hash, valid=excluded.valid,
@@ -407,6 +415,7 @@ class AtlasStore:
                     project.grant_id, project.role,
                     json.dumps(project.tags), json.dumps(project.refs),
                     json.dumps([normalize_milestone(m) for m in project.milestones]),
+                    json.dumps(project.to_dict()["history"]),
                     project.collection_id, project.kind,
                     project.body, project.path, project.content_hash,
                     0 if errors else 1, json.dumps(errors),
@@ -434,14 +443,15 @@ class AtlasStore:
 
     def projects_for_citekey(self, citekey: str) -> list[Project]:
         """Research projects whose refs contain ``citekey`` — backward
-        resolution for the library reference panel (cite-key usage lookup)."""
+        resolution for the library reference panel (cite-key usage lookup);
+        a ``[@key]`` in the description counts too (ADR-0026)."""
         if not citekey:
             return []
-        return [p for p in self.list_projects() if citekey in p.refs]
+        return [p for p in self.list_projects() if citekey in p.refs or cites(p.body, citekey)]
 
     @_serialized
     def save_project_file(self, project: Project) -> Path:
-        return entity_store.save_file(_PROJECT_SPEC, project)
+        return entity_store.save_file(_PROJECT_SPEC, project, self._connect)
 
     def delete_project(self, project_id: str) -> None:
         self._delete_entity(_PROJECT_SPEC, index_links.KIND_PROJECT, project_id)
@@ -454,8 +464,8 @@ class AtlasStore:
                 """INSERT INTO publications
                    (id, title, status, venue, type, authors, submitted, published,
                     due, tags, refs, derived_from, manuscripts, projects, paper,
-                    collection_id, kind, body, path, content_hash, valid, errors)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    history, collection_id, kind, body, path, content_hash, valid, errors)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                      title=excluded.title, status=excluded.status,
                      venue=excluded.venue, type=excluded.type,
@@ -464,7 +474,8 @@ class AtlasStore:
                      tags=excluded.tags, refs=excluded.refs,
                      derived_from=excluded.derived_from,
                      manuscripts=excluded.manuscripts, projects=excluded.projects,
-                     paper=excluded.paper, collection_id=excluded.collection_id,
+                     paper=excluded.paper, history=excluded.history,
+                     collection_id=excluded.collection_id,
                      kind=excluded.kind, body=excluded.body, path=excluded.path,
                      content_hash=excluded.content_hash, valid=excluded.valid,
                      errors=excluded.errors""",
@@ -477,6 +488,7 @@ class AtlasStore:
                     json.dumps(publication.derived_from),
                     json.dumps(publication.manuscripts),
                     json.dumps(publication.projects), publication.paper,
+                    json.dumps(publication.to_dict()["history"]),
                     publication.collection_id, publication.kind,
                     publication.body, publication.path, publication.content_hash,
                     0 if errors else 1, json.dumps(errors),
@@ -534,13 +546,13 @@ class AtlasStore:
 
     def publications_for_citekey(self, citekey: str) -> list[Publication]:
         """Publications that reference ``citekey`` — via their bibliography
-        (refs) or the paper self-link. Backward resolution for the library
-        reference panel (cite-key usage lookup)."""
+        (refs), the paper self-link or a ``[@key]`` in their notes (ADR-0026).
+        Backward resolution for the library reference panel."""
         if not citekey:
             return []
         return [
             p for p in self.list_publications()
-            if citekey in p.refs or p.paper == citekey
+            if citekey in p.refs or p.paper == citekey or cites(p.body, citekey)
         ]
 
     def publications_for_project(self, project_id: str) -> list[Publication]:
@@ -555,7 +567,7 @@ class AtlasStore:
 
     @_serialized
     def save_publication_file(self, publication: Publication) -> Path:
-        return entity_store.save_file(_PUBLICATION_SPEC, publication)
+        return entity_store.save_file(_PUBLICATION_SPEC, publication, self._connect)
 
     # --- Zettel (atlas.zettel/1, issue #180) ---------------------------------
     def index_zettel(self, zettel: Zettel) -> None:
@@ -613,15 +625,16 @@ class AtlasStore:
         return [_row_to_zettel(r) for r in rows]
 
     def zettel_for_citekey(self, citekey: str) -> list[Zettel]:
-        """Zettel whose ``refs`` contain ``citekey`` — the Paper detail page
-        asks this to show the Lektuerezettel of a paper (user story 38)."""
+        """Zettel whose ``refs`` contain ``citekey`` or whose body cites it as
+        ``[@key]`` (ADR-0026) — the Paper detail page asks this to show the
+        Lektuerezettel of a paper (user story 38)."""
         if not citekey:
             return []
-        return [z for z in self.list_zettel() if citekey in z.refs]
+        return [z for z in self.list_zettel() if citekey in z.refs or cites(z.body, citekey)]
 
     @_serialized
     def save_zettel_file(self, zettel: Zettel) -> Path:
-        return entity_store.save_file(_ZETTEL_SPEC, zettel)
+        return entity_store.save_file(_ZETTEL_SPEC, zettel, self._connect)
 
     def delete_zettel(self, zettel_id: str) -> None:
         self._delete_entity(_ZETTEL_SPEC, index_links.KIND_ZETTEL, zettel_id)
@@ -659,8 +672,10 @@ class AtlasStore:
         return journal_store.add_task(self._connect, week, day, text)
 
     @_serialized
-    def update_task(self, week: str, body_index: int, text: str) -> dict:
-        return journal_store.update_task(self._connect, week, body_index, text)
+    def update_task(
+        self, week: str, body_index: int, text: Optional[str] = None, note: Optional[str] = None
+    ) -> dict:
+        return journal_store.update_task(self._connect, week, body_index, text, note)
 
     @_serialized
     def toggle_task(self, week: str, body_index: int) -> dict:
@@ -772,9 +787,12 @@ class AtlasStore:
     def reindex(self) -> dict:
         """Rebuild every entity index from its archive folder (P1). Idempotent:
         running it twice yields the same DB state. Last file wins on
-        id-collision (also reported). Non-recursive globs are deliberate —
-        e.g. per-project document subfolders projekte/<id>/ (issue #49) are
-        never scanned for Markdown."""
+        id-collision (also reported). A file that cannot be read (broken YAML
+        of a hand edit, a lock that outlasts the retries) counts as invalid,
+        is listed in ``unreadable`` (``{path, error, locked}``) and never
+        stops the rest; a database failure does. Non-recursive globs are
+        deliberate — e.g. per-project document subfolders projekte/<id>/
+        (issue #49) are never scanned for Markdown."""
         # The edge table is rebuilt with the entities: wipe it first, then let
         # every indexed body and Task line refill it (ADR-0020).
         with closing(self._connect()) as conn:
@@ -808,6 +826,10 @@ class AtlasStore:
             "zettel_invalid": zettel["invalid"],
             "journals_indexed": journals["count"],
             "journals_invalid": journals["invalid"],
+            "unreadable": [
+                *ideas["unreadable"], *nodes["unreadable"], *projects["unreadable"],
+                *publications["unreadable"], *zettel["unreadable"], *journals["unreadable"],
+            ],
         }
 
     def check(self, resolve_citekey=None) -> list[dict]:
@@ -892,10 +914,14 @@ class AtlasStore:
         # Journal weeks: structural validation (week id vs. filename, day
         # outside the week, more than five Wochenziele).
         for week in self.list_journal_weeks():
+            journal = Journal(week=week["week"], goals=week["goals"])
             if week["path"] and Path(week["path"]).exists():
-                journal = Journal.from_file(week["path"])
-            else:
-                journal = Journal(week=week["week"], goals=week["goals"])
+                try:  # hand-edited since it was indexed: name it, never fail
+                    journal = Journal.from_file(week["path"])
+                except Exception as exc:  # noqa: BLE001
+                    report.append({"id": week["week"], "path": week["path"],
+                                   "issues": [f"Datei nicht lesbar: {exc}"]})
+                    continue
             issues = journal.validate()
             if issues:
                 report.append({"id": week["week"], "path": week["path"], "issues": issues})
@@ -946,7 +972,28 @@ class AtlasStore:
     # --- file write helper (UI/quick-capture write path) -------------------
     @_serialized
     def save_idea_file(self, idea: Idea) -> Path:
-        return entity_store.save_file(_IDEA_SPEC, idea)
+        return entity_store.save_file(_IDEA_SPEC, idea, self._connect)
+
+    @_serialized
+    def ensure_current(self, kind: str, entity) -> None:
+        """Raise ``entity_store.FileChanged`` unless ``entity``'s file is what
+        the index read — before a write that moves the file away (the type
+        switch) or that must not start on a stale source (promote). The same
+        check every ``save_*_file`` makes (``entity_store.check_current``)."""
+        entity_store.check_current(_SPEC_BY_KIND[kind], self._connect, entity)
+
+    def free_id(self, kind: str, base: str) -> str:
+        """The id for a NEW entity of ``kind`` (``index_links.KIND_*``) — every
+        create/import/promote path asks here: ``base``, else ``base-2``…, never
+        one the index has or an ``<id>.md`` on disk holds, indexed or not (a
+        skipped hand edit stays the user's). Publications and Projects also
+        skip a leftover document folder (``DocumentFolder.free_id``)."""
+        spec = _SPEC_BY_KIND[kind]
+        exists = lambda i: entity_store.get_by_id(self._connect, spec, i) is not None  # noqa: E731
+        folder = _DOCUMENT_FOLDERS.get(kind)
+        if folder is not None:
+            return folder.free_id(base, exists)
+        return entity_store.free_id(base, exists, spec.dir_fn())
 
 
 def _index_body_links(conn: sqlite3.Connection, kind: str, entity_id: str, body: str) -> None:
@@ -1010,6 +1057,7 @@ def _row_to_publication(row: sqlite3.Row) -> Publication:
         manuscripts=json.loads(row["manuscripts"]),
         projects=json.loads(row["projects"]),
         paper=row["paper"],
+        history=json.loads(row["history"]),
         body=row["body"],
         path=row["path"],
         collection_id=row["collection_id"],
@@ -1044,6 +1092,7 @@ def _row_to_project(row: sqlite3.Row) -> Project:
         tags=json.loads(row["tags"]),
         refs=json.loads(row["refs"]),
         milestones=json.loads(row["milestones"]),
+        history=json.loads(row["history"]),
         body=row["body"],
         path=row["path"],
         collection_id=row["collection_id"],
@@ -1115,6 +1164,12 @@ _SPEC_BY_KIND = {
 }
 
 _PATH_TABLES = tuple((kind, spec.table) for kind, spec in _SPEC_BY_KIND.items())
+
+# The entities with a document folder per id (#226) — free_id skips those, too.
+_DOCUMENT_FOLDERS = {
+    index_links.KIND_PROJECT: documents.PROJECTS,
+    index_links.KIND_PUBLICATION: documents.PUBLICATIONS,
+}
 
 # Rueckverweis group names of the API payload, per source kind.
 _BACKLINK_GROUPS = {

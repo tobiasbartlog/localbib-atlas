@@ -189,7 +189,7 @@ def test_project_create_writes_research_project_file(atlas_client, tmp_path):
     assert proj["id"] in [p["id"] for p in plist]
 
     md = (tmp_path / "projekte" / f"{proj['id']}.md").read_text(encoding="utf-8")
-    assert "schema: atlas.project/4" in md
+    assert "schema: atlas.project/5" in md
     assert "funder: DFG" in md
     assert "grant_id: BA 1234/5-1" in md
     assert "title: Kickoff" in md

@@ -29,6 +29,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from atlas import collection_entries, documents
+from atlas.api_errors import AtlasRoute
 from atlas.collection_entries import KIND_PROJECT, KIND_PUBLICATION, KINDS
 from atlas.domain import Project
 
@@ -127,7 +128,7 @@ def _collection_row(collection: dict, entry) -> dict:
 
 def build_collections_router(store, broadcaster) -> APIRouter:
     """The Collection-entry part of the Atlas API. Mounted by ``api.build_router``."""
-    router = APIRouter(tags=["atlas-collections"])
+    router = APIRouter(tags=["atlas-collections"], route_class=AtlasRoute)
 
     def _publication_exists(entity_id: str) -> bool:
         return store.get_publication(entity_id) is not None
@@ -283,6 +284,9 @@ def build_collections_router(store, broadcaster) -> APIRouter:
         # an entity of the other kind has it — indexed or only on disk.
         new_id = folders[1].free_id(entry.id, exists, count_folders=False)
         new = collection_entries.switch_entity(entry, target, new_id)
+        # The old file goes below: never one whose hand edit the index has
+        # not read (409 error.atlas.file_changed) — that edit would be lost.
+        store.ensure_current(collection_entries.entity_kind(entry), entry)
         # All or nothing. The confirmed switch carries every value over into
         # the new file; only then do the documents follow and the old file go
         # (ADR-0022). A lasting lock on the folder or the old file takes back

@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas.project/5",
+  "title": "Atlas Research Project Frontmatter",
+  "description": "YAML frontmatter of a research project / Forschungsprojekt (projekte/*.md). ADR-0004: atlas.project/3 is a DIFFERENT entity than atlas.project/1|2 — those are legacy Publications and are migrated to atlas.publication/1 at startup. Carries the funded-project facts (Laufzeit, funder, Foerderkennzeichen, role), structured milestones (rendered as a timeline with next/overdue indication) and project-relevant literature refs (Paper cite keys; hanging refs are warnings, never auto-repaired). Work packages live in the Markdown body as headings with GFM checklists, not in the frontmatter. /4 (ADR-0022, issue #205) adds the optional Collection link: a file with collection_id is the Atlas side of a core Collection moved to a research project, its literature is that Collection (read live through LibraryApi), so it carries no refs; kind records the entry type (always project in this folder). /5 adds the optional history (Verlauf): one entry {date, status} per status change.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "atlas.project/5"
+    },
+    "id": {
+      "type": "string",
+      "description": "Immutable, equals filename without .md.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "description": "Lifecycle planned → applied → active → finished, plus terminal rejected.",
+      "enum": [
+        "planned",
+        "applied",
+        "active",
+        "finished",
+        "rejected"
+      ]
+    },
+    "start": {
+      "type": "string",
+      "description": "Laufzeit start.",
+      "format": "date"
+    },
+    "end": {
+      "type": "string",
+      "description": "Laufzeit end.",
+      "format": "date"
+    },
+    "funder": {
+      "type": "string",
+      "description": "Funding body (e.g. DFG, BMBF, EU)."
+    },
+    "grant_id": {
+      "type": "string",
+      "description": "Foerderkennzeichen / grant number."
+    },
+    "role": {
+      "type": "string",
+      "description": "Own role in the project (e.g. PI, Mitarbeiter, Antragsteller)."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "refs": {
+      "type": "array",
+      "description": "Project-relevant literature as Paper cite keys → join to the LocalBib library. Hanging refs are warnings, never auto-repaired.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "milestones": {
+      "type": "array",
+      "description": "Structured milestones — the UI renders a timeline with next/overdue indication.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "date": {
+            "type": "string",
+            "format": "date"
+          },
+          "done": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "default": []
+    },
+    "history": {
+      "type": "array",
+      "description": "Verlauf: every status change, oldest first, appended by Atlas on each change; an undo replaces the whole list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "date",
+          "status"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "Day of the change."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "applied",
+              "active",
+              "finished",
+              "rejected"
+            ],
+            "description": "The status entered on that day."
+          }
+        }
+      },
+      "default": []
+    },
+    "collection_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "ID of the core Collection this entry belongs to (ADR-0022). Its literature list is the Collection, never refs in this file. Removed — and the last membership frozen into refs once — when the Collection is deleted."
+    },
+    "kind": {
+      "const": "project",
+      "description": "Entry type of a Collection entry; only set together with collection_id. Atlas stores it, the core knows nothing about it."
+    }
+  },
+  "dependentRequired": {
+    "kind": [
+      "collection_id"
+    ]
+  },
+  "if": {
+    "required": [
+      "collection_id"
+    ]
+  },
+  "then": {
+    "not": {
+      "required": [
+        "refs"
+      ]
+    }
+  }
+}

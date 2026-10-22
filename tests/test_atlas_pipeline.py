@@ -28,6 +28,11 @@ def client(atlas_app, monkeypatch):
         yield c
 
 
+def _plain(entries: list) -> list:
+    """YAML reads an ISO date as a date — compare as the strings Atlas wrote."""
+    return [{k: str(v) for k, v in e.items()} for e in entries]
+
+
 def _frontmatter(tmp_path, pub_id: str) -> dict:
     text = (tmp_path / "veroeffentlichungen" / f"{pub_id}.md").read_text(encoding="utf-8")
     return parse_frontmatter(text)[0]
@@ -52,7 +57,55 @@ def _frontmatter(tmp_path, pub_id: str) -> dict:
 )
 def test_status_changes_fills_an_empty_date_and_never_clears_one(target, existing, expected):
     pub = Publication(id="p", title="P", **existing)
-    assert status_changes(pub, target, TODAY) == expected
+    changes = status_changes(pub, target, TODAY)
+    changes.pop("history", None)  # the Verlauf has its own tests below
+    assert changes == expected
+
+
+def test_a_status_change_lands_in_the_verlauf_with_its_venue():
+    pub = Publication(id="p", title="P", status="drafting", venue="Fachkonferenz 2027",
+                      history=[{"date": "2026-06-02", "status": "planned"}])
+    changes = status_changes(pub, "submitted", TODAY)
+    assert changes["history"] == [
+        {"date": "2026-06-02", "status": "planned", "venue": None},
+        {"date": "2026-10-09", "status": "submitted", "venue": "Fachkonferenz 2027"},
+    ]
+    assert pub.history == [{"date": "2026-06-02", "status": "planned"}]  # pure: no mutation
+
+
+def test_the_same_status_writes_no_verlauf_entry():
+    pub = Publication(id="p", title="P", status="drafting")
+    assert "history" not in status_changes(pub, "drafting", TODAY)
+
+
+def test_a_new_venue_starts_a_new_submission():
+    """„Woanders einreichen": the new target, its deadline, the old
+    submission date gone (it stays in the Verlauf)."""
+    pub = Publication(id="p", title="P", status="rejected", venue="Konferenz A",
+                      submitted="2026-09-01", due="2026-08-15")
+    changes = status_changes(pub, "drafting", TODAY, venue=" Journal B ", due="2027-01-31")
+    assert changes["venue"] == "Journal B"
+    assert changes["submitted"] is None
+    assert changes["due"] == "2027-01-31"
+    assert changes["history"][-1] == {"date": "2026-10-09", "status": "drafting", "venue": "Journal B"}
+
+
+def test_the_same_venue_is_no_new_target():
+    pub = Publication(id="p", title="P", status="submitted", venue="Journal B", submitted="2026-09-01")
+    changes = status_changes(pub, "in-revision", TODAY, venue="Journal B")
+    assert "venue" not in changes and "submitted" not in changes
+
+
+def test_project_status_changes_record_the_verlauf():
+    from atlas.domain import Project
+    from atlas.pipeline import project_status_changes
+
+    project = Project(id="x", title="X", status="applied")
+    changes = project_status_changes(project, "active", TODAY)
+    assert changes == {"status": "active", "history": [{"date": "2026-10-09", "status": "active", "venue": None}]}
+    assert project_status_changes(project, "applied", TODAY) == {"status": "applied"}
+    with pytest.raises(ValueError):
+        project_status_changes(project, "submitted", TODAY)
 
 
 def test_status_changes_refuses_an_unknown_status():
@@ -70,11 +123,12 @@ def test_the_status_lists_are_the_schemas_in_one_place():
     from atlas import agenda, domain
 
     schema = json.loads(
-        (Path(__file__).resolve().parents[1] / "schemas" / "atlas.publication-2.json").read_text(encoding="utf-8")
+        (Path(__file__).resolve().parents[1] / "schemas" / "atlas.publication-3.json").read_text(encoding="utf-8")
     )
     enum = schema["properties"]["status"]["enum"]
     assert tuple(enum) == STATUSES
     assert set(enum) == domain.PUBLICATION_STATUSES
+    assert schema["properties"]["history"]["items"]["properties"]["status"]["enum"] == enum
     assert agenda.CLOSED_PUBLICATION_STATUSES == {"published", "rejected", "withdrawn"}
     assert agenda.CLOSED_PUBLICATION_STATUSES <= domain.PUBLICATION_STATUSES
 
@@ -125,6 +179,56 @@ def test_undo_restores_the_status_and_clears_only_the_set_date(client, tmp_path)
     assert back["due"] == "2026-11-01"
     fm = _frontmatter(tmp_path, pub["id"])
     assert "submitted" not in fm and fm["status"] == "drafting"
+
+
+def test_the_verlauf_is_written_and_undo_puts_the_previous_one_back(client, tmp_path):
+    pub = client.post(f"{API}/publications", json={
+        "title": "Paper V", "status": "drafting", "venue": "Konferenz A",
+    }).json()
+    data = client.post(f"{API}/publications/{pub['id']}/status", json={"status": "submitted"}).json()
+    assert data["publication"]["history"] == [
+        {"date": "2026-10-09", "status": "submitted", "venue": "Konferenz A"},
+    ]
+    fm = _frontmatter(tmp_path, pub["id"])
+    assert _plain(fm["history"]) == [{"date": "2026-10-09", "status": "submitted", "venue": "Konferenz A"}]
+    assert fm["schema"] == "atlas.publication/3"
+    assert data["previous"] == {"status": "drafting", "submitted": None, "history": []}
+    back = client.put(f"{API}/publications/{pub['id']}", json=data["previous"]).json()
+    assert back["status"] == "drafting" and back["submitted"] is None and back["history"] == []
+    assert "history" not in _frontmatter(tmp_path, pub["id"])
+
+
+def test_rejected_then_submitted_elsewhere_in_two_calls(client, tmp_path):
+    pub = client.post(f"{API}/publications", json={
+        "title": "Paper W", "status": "submitted", "venue": "Konferenz A", "submitted": "2026-09-01",
+    }).json()
+    client.post(f"{API}/publications/{pub['id']}/status", json={"status": "rejected"})
+    data = client.post(f"{API}/publications/{pub['id']}/status", json={
+        "status": "drafting", "venue": "Journal B", "due": "2027-01-31",
+    }).json()
+    p = data["publication"]
+    assert (p["status"], p["venue"], p["submitted"], p["due"]) == ("drafting", "Journal B", None, "2027-01-31")
+    assert [(h["status"], h["venue"]) for h in p["history"]] == [("rejected", "Konferenz A"), ("drafting", "Journal B")]
+    assert data["previous"]["venue"] == "Konferenz A" and data["previous"]["submitted"] == "2026-09-01"
+    assert data["set"] == []
+
+
+def test_a_project_status_change_has_its_verlauf_and_codes(client, tmp_path):
+    proj = client.post(f"{API}/projects", json={"title": "DFG", "status": "applied"}).json()
+    data = client.post(f"{API}/projects/{proj['id']}/status", json={"status": "active"}).json()
+    assert data["project"]["status"] == "active"
+    assert data["project"]["history"] == [{"date": "2026-10-09", "status": "active", "venue": None}]
+    assert "timeline" in data["project"]
+    assert data["previous"] == {"status": "applied", "history": []}
+    text = (tmp_path / "projekte" / f"{proj['id']}.md").read_text(encoding="utf-8")
+    fm = parse_frontmatter(text)[0]
+    assert fm["schema"] == "atlas.project/5" and _plain(fm["history"]) == [{"date": "2026-10-09", "status": "active"}]
+    back = client.put(f"{API}/projects/{proj['id']}", json=data["previous"]).json()
+    assert back["status"] == "applied" and back["history"] == []
+    resp = client.post(f"{API}/projects/gibt-es-nicht/status", json={"status": "active"})
+    assert resp.status_code == 404 and resp.json()["detail"] == "error.atlas.project_not_found"
+    resp = client.post(f"{API}/projects/{proj['id']}/status", json={"status": "published"})
+    assert resp.status_code == 422 and resp.json()["detail"] == "error.atlas.status_invalid"
 
 
 def test_unknown_publication_and_status_are_codes(client):

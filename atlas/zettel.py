@@ -14,7 +14,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from atlas.domain import Idea, make_idea_id, parse_frontmatter, section_anchors, serialize, slugify
 from atlas.links import extract_wikilinks
@@ -144,18 +144,6 @@ def make_zettel_id(title: str, *, today: Optional[date] = None) -> str:
     """Quick-capture id: ``YYYY-MM-DD-<title-slug>`` (like an Idea, P5)."""
     today = today or date.today()
     return f"{today.isoformat()}-{slugify(title)}".rstrip("-")
-
-
-def unique_zettel_id(base: str, taken: Iterable[str]) -> str:
-    """``base``, or ``base-2``/``base-3``/… when it is already ``taken``.
-    Pure — the caller supplies the ids that exist (store or directory)."""
-    existing = set(taken)
-    if base not in existing:
-        return base
-    n = 2
-    while f"{base}-{n}" in existing:
-        n += 1
-    return f"{base}-{n}"
 
 
 def new_zettel(title: str, *, today: Optional[date] = None, **fields) -> Zettel:

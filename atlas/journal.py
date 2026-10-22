@@ -18,12 +18,21 @@ the weekday is decoration Atlas writes. A Task is a GFM checklist line. Its
 ``body_index`` is the same contract the Atlas Project checklist toggle uses:
 the n-th non-fenced checklist line of the body, counted in document order —
 here continuous across all days.
+
+A Task's **Notiz** is the run of indented, non-Task lines right below it (a
+GFM list continuation); blank lines belong to it only between two of them.
+The Task line plus its Notiz is one block: delete, reorder and move take the
+block, toggle and edit touch only the Task line::
+
+    - [ ] Mail an Betreuer
+      Fragen zur Gliederung 3.2
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
@@ -49,6 +58,10 @@ _TAG_RE = re.compile(r"(?<!\S)#([^\s#]+)")
 _MOVED_TO_RE = re.compile(MOVED_TO + r"\s*(\d{4}-\d{2}-\d{2})")
 _MOVED_FROM_RE = re.compile(MOVED_FROM + r"\s*(\d{4}-\d{2}-\d{2})")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A checklist line inside a Notiz is written as "- \[ ]" so it never becomes
+# a Task of its own (and never shifts a body_index); reading undoes that.
+_ESCAPED_TASK_RE = re.compile(r"^(\s*[-*]\s+)\\(\[[ xX]\]\s)")
+NOTE_INDENT = "  "
 
 
 # =============================================================================
@@ -113,6 +126,51 @@ def _make_task(match: re.Match, body_index: int, line: int, day: Optional[str]) 
     }
 
 
+def _note_end(lines: list[str], flags: list[bool], line: int) -> int:
+    """Exclusive end of the Notiz under the Task at ``line``: the indented
+    lines below it that are no Task (inside a fence, nothing is a Task);
+    blank lines count only when another such line follows."""
+    end = line + 1
+    for i in range(line + 1, len(lines)):
+        text = lines[i]
+        if not text.strip():
+            continue
+        if text[:1] in (" ", "\t") and (flags[i] or not _TASK_RE.match(text)):
+            end = i + 1
+            continue
+        break
+    return end
+
+
+def _note_text(note_lines: list[str]) -> str:
+    unescaped = [_ESCAPED_TASK_RE.sub(r"\1\2", ln) for ln in note_lines]
+    return textwrap.dedent("\n".join(unescaped))
+
+
+def note_lines(note: str) -> list[str]:
+    """The lines that write ``note`` under a Task: indented, outer blank lines
+    dropped, a checklist line escaped, an unclosed fence closed — otherwise the
+    rest of the week would read as code and its Tasks would vanish."""
+    rows = (note or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while rows and not rows[0].strip():
+        rows.pop(0)
+    while rows and not rows[-1].strip():
+        rows.pop()
+    if sum(1 for r in rows if r.lstrip().startswith("```")) % 2:
+        rows.append("```")
+    out: list[str] = []
+    for row in rows:
+        if not row.strip():
+            out.append("")
+            continue
+        line = NOTE_INDENT + row
+        m = _TASK_RE.match(line)
+        if m:
+            line = m.group(1)[:-1] + "\\[" + m.group(2) + m.group(3) + m.group(4)
+        out.append(line)
+    return out
+
+
 def _scan_body(body: str) -> tuple[list[dict], list[dict]]:
     """One pass over ``body``: (day sections, flat task list)."""
     lines = (body or "").split("\n")
@@ -140,6 +198,8 @@ def _scan_body(body: str) -> tuple[list[dict], list[dict]]:
             continue
         body_index += 1
         task = _make_task(tm, body_index, i, current["date"] if current else None)
+        task["note_end"] = _note_end(lines, flags, i)
+        task["note"] = _note_text(lines[i + 1:task["note_end"]])
         tasks.append(task)
         if current is not None:
             current["tasks"].append(task)
@@ -228,9 +288,12 @@ def ensure_day(body: str, day: str) -> tuple[str, int]:
     return _body_of(lines, trailing), len(lines) - 1
 
 
-def append_task(body: str, day: str, text: str) -> tuple[str, int]:
+def append_task(
+    body: str, day: str, text: str, *, note: Iterable[str] = ()
+) -> tuple[str, int]:
     """Append a Task to ``day``, creating the day section (and the whole body)
-    when needed. Returns ``(body, body_index)`` of the new Task."""
+    when needed. ``note`` are Notiz lines written verbatim below it (a move
+    carries them byte for byte). Returns ``(body, body_index)`` of the new Task."""
     body, heading_line = ensure_day(body, day)
     lines, trailing = _lines_of(body)
     days = parse_days(_body_of(lines, trailing))
@@ -238,7 +301,7 @@ def append_task(body: str, day: str, text: str) -> tuple[str, int]:
     at = _section_end(days, index, len(lines))
     while at > heading_line + 1 and lines[at - 1].strip() == "":
         at -= 1
-    lines.insert(at, task_line(text))
+    lines[at:at] = [task_line(text), *note]
     new_body = _body_of(lines, trailing)
     inserted = next(t for t in parse_tasks(new_body) if t["line"] == at)
     return new_body, inserted["body_index"]
@@ -277,12 +340,24 @@ def toggle_task(body: str, body_index: int) -> str:
 
 
 def delete_task(body: str, body_index: int) -> str:
-    """Remove one Task line. The day heading stays, even when it falls empty."""
+    """Remove one Task line with its Notiz. The day heading stays, even when
+    it falls empty."""
     task = find_task(body, body_index)
     if task is None:
         raise KeyError(f"Kein Task mit body_index {body_index}")
     lines, trailing = _lines_of(body)
-    del lines[task["line"]]
+    del lines[task["line"]:task["note_end"]]
+    return _body_of(lines, trailing)
+
+
+def set_note(body: str, body_index: int, note: str) -> str:
+    """Replace the Notiz of one Task (an empty ``note`` removes it). The Task
+    line and every other line stay byte-identical."""
+    task = find_task(body, body_index)
+    if task is None:
+        raise KeyError(f"Kein Task mit body_index {body_index}")
+    lines, trailing = _lines_of(body)
+    lines[task["line"] + 1:task["note_end"]] = note_lines(note)
     return _body_of(lines, trailing)
 
 
@@ -293,6 +368,13 @@ def _set_marker(raw: str, arrow: str, day: Optional[str]) -> str:
     if day is None:
         return text
     return f"{text} {arrow}{day}".strip()
+
+
+def _with_marker(line: str, arrow: str, day: Optional[str]) -> str:
+    """The Task ``line`` with exactly one ``arrow`` marker (None removes it)."""
+    m = _TASK_RE.match(line)
+    assert m is not None
+    return m.group(1) + m.group(2) + m.group(3) + _set_marker(m.group(4), arrow, day)
 
 
 @dataclass
@@ -318,24 +400,24 @@ def move_task(
     target_body: Optional[str] = None,
 ) -> MoveResult:
     """Uebertrag: mark the source line with ``→to_day`` and append the carried
-    Task to ``to_day`` with ``←<origin>``. ``target_body`` carries the target
-    week when the target day lies outside this body's week; without it the
-    Task is carried inside ``body``."""
+    Task to ``to_day`` with ``←<origin>``. The Notiz travels with the open
+    Task; the marked source line stays behind bare. ``target_body`` carries
+    the target week when the target day lies outside this body's week;
+    without it the Task is carried inside ``body``."""
     task = find_task(body, body_index)
     if task is None:
         raise KeyError(f"Kein Task mit body_index {body_index}")
     iso = as_date(to_day).isoformat()
 
-    source = _rewrite_line(
-        body,
-        body_index,
-        lambda m: m.group(1) + m.group(2) + m.group(3) + _set_marker(m.group(4), MOVED_TO, iso),
-    )
+    lines, trailing = _lines_of(body)
+    note = lines[task["line"] + 1:task["note_end"]]
+    lines[task["line"]:task["note_end"]] = [_with_marker(lines[task["line"]], MOVED_TO, iso)]
+    source = _body_of(lines, trailing)
     carried = _set_marker(_set_marker(task["raw"], MOVED_TO, None), MOVED_FROM, task["day"])
 
     same_body = target_body is None
     target = source if same_body else target_body
-    target, index = append_task(target, iso, carried)
+    target, index = append_task(target, iso, carried, note=note)
     return MoveResult(
         source_body=target if same_body else source,
         target_body=target,
@@ -374,10 +456,11 @@ def undo_move(
     also across the week boundary (``target_body`` = the other week's body).
 
     Allowed only while both lines are what the move left: the source still
-    points at the target's day, the target is still open, carries ``←`` the
-    source's day and otherwise the source's text. Anything else raises
-    :class:`MoveChanged`; a missing line raises ``KeyError``. Every other line
-    stays byte-identical (ADR-0020)."""
+    points at the target's day and has no Notiz of its own, the target is
+    still open, carries ``←`` the source's day and otherwise the source's
+    text. Anything else raises :class:`MoveChanged`; a missing line raises
+    ``KeyError``. The target's Notiz goes back under the source line; every
+    other line stays byte-identical (ADR-0020)."""
     source = find_task(source_body, source_index)
     if source is None:
         raise KeyError(f"Kein Task mit body_index {source_index}")
@@ -390,30 +473,39 @@ def undo_move(
     if (
         not source["moved_to"]
         or source["moved_to"] != target["day"]
+        or source["note_end"] != source["line"] + 1
         or target["done"]
         or target["raw"] != expected
         or (same_body and target["line"] == source["line"])
     ):
         raise MoveChanged("Die Zeilen des Uebertrags wurden seither geaendert")
 
-    restored = _rewrite_line(
-        source_body,
-        source_index,
-        lambda m: m.group(1) + m.group(2) + m.group(3) + _set_marker(m.group(4), MOVED_TO, None),
-    )
+    s, t0, t1 = source["line"], target["line"], target["note_end"]
+    lines, trailing = _lines_of(source_body)
+    lines[s] = _with_marker(lines[s], MOVED_TO, None)
     if same_body:
-        lines, trailing = _lines_of(restored)
-        del lines[target["line"]]
+        note = lines[t0 + 1:t1]
+        # The later block first, so the earlier one's line numbers still hold.
+        if t0 > s:
+            del lines[t0:t1]
+            lines[s + 1:s + 1] = note
+        else:
+            lines[s + 1:s + 1] = note
+            del lines[t0:t1]
         restored = _body_of(lines, trailing)
         new_index = source_index - (1 if target_index < source_index else 0)
         return UndoMoveResult(restored, restored, new_index, True)
-    lines, trailing = _lines_of(target_body)
-    del lines[target["line"]]
-    return UndoMoveResult(restored, _body_of(lines, trailing), source_index, False)
+    t_lines, t_trailing = _lines_of(target_body)
+    lines[s + 1:s + 1] = t_lines[t0 + 1:t1]
+    del t_lines[t0:t1]
+    return UndoMoveResult(
+        _body_of(lines, trailing), _body_of(t_lines, t_trailing), source_index, False
+    )
 
 
 def reorder_task(body: str, body_index: int, position: int) -> str:
-    """Move one Task to ``position`` within the Tasks of its own day."""
+    """Move one Task (with its Notiz) to ``position`` within the Tasks of its
+    own day."""
     days, tasks = _scan_body(body)
     task = next((t for t in tasks if t["body_index"] == body_index), None)
     if task is None:
@@ -422,17 +514,20 @@ def reorder_task(body: str, body_index: int, position: int) -> str:
     if day is None:
         raise KeyError(f"Task {body_index} steht unter keinem Tag")
 
-    order = [t["line"] for t in day["tasks"]]
-    current = order.index(task["line"])
-    position = max(0, min(int(position), len(order) - 1))
+    blocks = [(t["line"], t["note_end"]) for t in day["tasks"]]
+    current = blocks.index((task["line"], task["note_end"]))
+    position = max(0, min(int(position), len(blocks) - 1))
     if position == current:
         return body
 
     lines, trailing = _lines_of(body)
-    moved = lines.pop(task["line"])
-    rest = [ln if ln < task["line"] else ln - 1 for ln in order if ln != task["line"]]
-    at = rest[position] if position < len(rest) else rest[-1] + 1
-    lines.insert(at, moved)
+    start, end = blocks[current]
+    moved = lines[start:end]
+    del lines[start:end]
+    size = end - start
+    rest = [(a - size, b - size) if a > start else (a, b) for a, b in blocks if a != start]
+    at = rest[position][0] if position < len(rest) else rest[-1][1]
+    lines[at:at] = moved
     return _body_of(lines, trailing)
 
 
@@ -443,10 +538,13 @@ def reorder_task(body: str, body_index: int, position: int) -> str:
 def parse_journal(text: str) -> tuple[dict, str]:
     """Split a Journal file into (frontmatter, body). The body is kept
     verbatim apart from the single separating blank line, so
-    ``render_journal(fm, body)`` returns the file unchanged."""
-    match = _FRONTMATTER_RE.match(text or "")
+    ``render_journal(fm, body)`` returns the file unchanged. A leading BOM
+    ("UTF-8 mit BOM", Windows PowerShell 5.1) is no content: the next write
+    saves the file without it, never a second header in front of it."""
+    text = (text or "").removeprefix("\ufeff")
+    match = _FRONTMATTER_RE.match(text)
     if not match:
-        return {}, text or ""
+        return {}, text
     data = yaml.safe_load(match.group(1))
     if data is None:
         data = {}
@@ -544,11 +642,16 @@ class Journal:
     @classmethod
     def from_markdown(cls, text: str, *, id_hint: Optional[str] = None) -> "Journal":
         """Tolerant parse (like the other entities): an invalid file still
-        indexes, validation is reported separately."""
+        indexes, validation is reported separately. Only what cannot be read
+        as a Journal at all raises — broken YAML, and ``goals`` that is no
+        list: re-serialising that would rewrite the user's frontmatter."""
         fm, body = parse_journal(text)
+        goals = fm.get("goals") or []
+        if not isinstance(goals, list):
+            raise ValueError("goals ist keine Liste")
         return cls(
             week=str(fm.get("week") or id_hint or ""),
-            goals=[normalize_goal(g) for g in (fm.get("goals") or [])],
+            goals=[normalize_goal(g) for g in goals],
             body=body,
         )
 

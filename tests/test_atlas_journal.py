@@ -7,6 +7,7 @@ import pytest
 from atlas.journal import (
     JOURNAL_SCHEMA,
     Journal,
+    MoveChanged,
     append_task,
     delete_task,
     find_task,
@@ -21,7 +22,9 @@ from atlas.journal import (
     render_journal,
     reorder_task,
     replace_task,
+    set_note,
     toggle_task,
+    undo_move,
 )
 
 FENCE = "```"
@@ -147,6 +150,17 @@ def test_round_trip_without_an_operation_is_identical():
     assert body == BODY
     assert render_journal(fm, body) == FILE
     assert Journal.from_markdown(FILE).to_markdown() == FILE
+
+
+def test_a_week_file_saved_with_a_bom_keeps_its_goals_and_one_header():
+    """"UTF-8 mit BOM" (Windows PowerShell 5.1, some editors) puts U+FEFF in
+    front of ``---`` (review 2026-10-18): it is still the frontmatter — the
+    goals stay, and the next write does not add a second header."""
+    journal = Journal.from_markdown("\ufeff" + FILE)
+    assert [g["title"] for g in journal.goals] == ["Kapitel 3 fertig", "Taeglich lesen"]
+    assert journal.body == BODY
+    journal.body = toggle_task(journal.body, 0)
+    assert journal.to_markdown().count("---\n") == 2
 
 
 def test_append_task_to_an_existing_day_leaves_every_other_line_untouched():
@@ -301,6 +315,136 @@ def test_reorder_moves_a_task_inside_its_day():
 
 def test_reorder_to_the_same_position_is_a_no_op():
     assert reorder_task(BODY, 2, 0) == BODY
+
+
+# =============================================================================
+# Notizen — the indented lines under a Task
+# =============================================================================
+
+NOTED = "\n".join(
+    [
+        "## Montag 2026-09-21",
+        "- [ ] Mail an Betreuer",
+        "  Fragen:",
+        "  - Gliederung 3.2",
+        "",
+        "  Termin klaeren",
+        "- [ ] Ohne Notiz",
+        "",
+        "## Mittwoch 2026-09-23",
+        "- [ ] Schon da",
+        "",
+    ]
+)
+
+
+def test_indented_lines_under_a_task_are_its_note():
+    tasks = parse_tasks(NOTED)
+    assert [t["body_index"] for t in tasks] == [0, 1, 2]
+    assert tasks[0]["note"] == "Fragen:\n- Gliederung 3.2\n\nTermin klaeren"
+    assert tasks[0]["text"] == "Mail an Betreuer"
+    assert tasks[1]["note"] == "" and tasks[2]["note"] == ""
+
+
+def test_a_note_ends_before_trailing_blank_lines_and_unindented_text():
+    tasks = parse_tasks("## Montag 2026-09-21\n- [ ] A\n  Notiz\n\nFreitext\n")
+    assert tasks[0]["note"] == "Notiz"
+
+
+def test_an_indented_checklist_line_stays_a_task_of_its_own():
+    tasks = parse_tasks("## Montag 2026-09-21\n- [ ] A\n  - [ ] Unteraufgabe\n")
+    assert [t["text"] for t in tasks] == ["A", "Unteraufgabe"]
+    assert tasks[0]["note"] == ""
+
+
+def test_set_note_writes_indented_lines_under_the_task_and_nothing_else():
+    after = set_note(BODY, 2, "Zeile eins\n\nZeile drei")
+    before_lines, after_lines = lines(BODY), lines(after)
+    assert after_lines[10:13] == ["  Zeile eins", "", "  Zeile drei"]
+    assert before_lines[:10] == after_lines[:10]
+    assert before_lines[10:] == after_lines[13:]
+    assert find_task(after, 2)["note"] == "Zeile eins\n\nZeile drei"
+    assert [t["body_index"] for t in parse_tasks(after)] == [0, 1, 2, 3, 4]
+
+
+def test_set_note_replaces_an_existing_note_and_an_empty_one_removes_it():
+    replaced = set_note(NOTED, 0, "Neu")
+    assert lines(replaced)[1:4] == ["- [ ] Mail an Betreuer", "  Neu", "- [ ] Ohne Notiz"]
+    assert set_note(set_note(BODY, 0, "Weg damit"), 0, "  \n ") == BODY
+
+
+def test_toggle_and_replace_leave_the_note_alone():
+    body = set_note(BODY, 0, "Bleibt")
+    assert find_task(toggle_task(body, 0), 0)["note"] == "Bleibt"
+    assert find_task(replace_task(body, 0, "Neuer Titel"), 0)["note"] == "Bleibt"
+
+
+def test_a_checklist_line_in_a_note_does_not_become_a_task():
+    after = set_note(BODY, 0, "- [ ] kein Task\n- [x] auch keiner")
+    assert len(parse_tasks(after)) == len(parse_tasks(BODY))
+    assert find_task(after, 0)["note"] == "- [ ] kein Task\n- [x] auch keiner"
+
+
+def test_an_unclosed_fence_in_a_note_is_closed_so_later_tasks_survive():
+    after = set_note(BODY, 0, FENCE + "\ncode")
+    assert len(parse_tasks(after)) == len(parse_tasks(BODY))
+    assert find_task(after, 0)["note"] == FENCE + "\ncode\n" + FENCE
+
+
+def test_delete_removes_the_task_with_its_note():
+    after = delete_task(NOTED, 0)
+    assert lines(after)[:2] == ["## Montag 2026-09-21", "- [ ] Ohne Notiz"]
+    assert "Fragen" not in after
+
+
+def test_move_carries_the_note_and_leaves_the_source_line_bare():
+    result = move_task(NOTED, 0, "2026-09-23")
+    body = result.target_body
+    source, carried = find_task(body, result.source_index), find_task(body, result.target_index)
+    assert source["moved_to"] == "2026-09-23" and source["note"] == ""
+    assert carried["note"] == "Fragen:\n- Gliederung 3.2\n\nTermin klaeren"
+    assert lines(body)[-6:-1] == [
+        "- [ ] Mail an Betreuer ←2026-09-21", "  Fragen:", "  - Gliederung 3.2", "", "  Termin klaeren",
+    ]
+
+
+def test_move_into_another_week_takes_the_note_out_of_the_source_week():
+    result = move_task(NOTED, 0, "2026-09-28", target_body="")
+    assert "Fragen" not in result.source_body
+    assert find_task(result.target_body, result.target_index)["note"].startswith("Fragen:")
+
+
+def test_undo_move_brings_the_note_back_byte_for_byte():
+    later = move_task(NOTED, 0, "2026-09-23")
+    undone = undo_move(later.source_body, later.source_index, later.target_index)
+    assert undone.source_body == NOTED
+
+    # To an earlier day of the same week: the carried block sits before the source.
+    body = set_note(NOTED, 2, "Notiz am Mittwoch")
+    earlier = move_task(body, 2, "2026-09-21")
+    undone = undo_move(earlier.source_body, earlier.source_index, earlier.target_index)
+    assert undone.source_body == body
+
+    other = move_task(NOTED, 0, "2026-09-28", target_body="")
+    undone = undo_move(other.source_body, other.source_index, other.target_index,
+                       target_body=other.target_body)
+    assert undone.source_body == NOTED
+    assert "Fragen" not in undone.target_body
+
+
+def test_undo_move_is_refused_once_the_source_got_a_note_of_its_own():
+    result = move_task(NOTED, 1, "2026-09-23")
+    changed = set_note(result.source_body, result.source_index, "Nachgetragen")
+    with pytest.raises(MoveChanged):
+        undo_move(changed, result.source_index, result.target_index)
+
+
+def test_reorder_moves_a_task_together_with_its_note():
+    after = reorder_task(NOTED, 0, 1)
+    assert lines(after)[1:7] == [
+        "- [ ] Ohne Notiz", "- [ ] Mail an Betreuer", "  Fragen:", "  - Gliederung 3.2", "", "  Termin klaeren",
+    ]
+    assert reorder_task(after, 1, 0) == NOTED
 
 
 # =============================================================================

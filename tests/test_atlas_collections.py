@@ -73,7 +73,7 @@ class TestDomain:
         pub = Publication(id="sammlung-1", title="T", refs=["Smith2020"],
                           collection_id=1, kind="publication")
         fm = pub.to_frontmatter()
-        assert fm["schema"] == "atlas.publication/2"
+        assert fm["schema"] == "atlas.publication/3"
         assert fm["collection_id"] == 1 and fm["kind"] == "publication"
         assert "refs" not in fm
         assert pub.validate() == []
@@ -82,7 +82,7 @@ class TestDomain:
         project = Project(id="p", title="P", collection_id=7, kind="project")
         again = Project.from_markdown(project.to_markdown(), id_hint="p")
         assert (again.collection_id, again.kind) == (7, "project")
-        assert again.to_frontmatter()["schema"] == "atlas.project/4"
+        assert again.to_frontmatter()["schema"] == "atlas.project/5"
 
     def test_wrong_kind_is_a_validation_error(self):
         pub = Publication(id="x", title="X", collection_id=1, kind="project")

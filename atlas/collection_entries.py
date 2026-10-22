@@ -37,7 +37,7 @@ import logging
 from datetime import date
 from typing import Any, Iterable, Optional, Union
 
-from atlas.domain import Project, Publication, normalize_milestone
+from atlas.domain import Project, Publication, normalize_history_entry, normalize_milestone
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +196,7 @@ _PUBLICATION_ONLY = (
     ("derived_from", "Hervorgegangen aus"),
     ("projects", "Forschungsprojekte"),
     ("paper", "Eigenes Paper"),
+    ("history", "Verlauf"),
 )
 _PROJECT_ONLY = (
     ("status", "Status"),
@@ -205,6 +206,7 @@ _PROJECT_ONLY = (
     ("grant_id", "Förderkennzeichen"),
     ("role", "Rolle"),
     ("milestones", "Meilensteine"),
+    ("history", "Verlauf"),
 )
 MOVED_FIELDS = (("title", "Titel"), ("tags", "Tags"), ("body", "Notizen"))
 _SECTION_TITLE = {
@@ -225,6 +227,12 @@ def _format_value(field: str, value: Any) -> str:
             m = normalize_milestone(raw)
             extra = ", ".join(x for x in (m["date"], "erledigt" if m["done"] else None) if x)
             parts.append(f"{m['title']} ({extra})" if extra else m["title"])
+        return "; ".join(parts)
+    if field == "history":
+        parts = []
+        for raw in value:
+            h = normalize_history_entry(raw)
+            parts.append(" ".join(x for x in (h["date"], h["status"], f"({h['venue']})" if h["venue"] else None) if x))
         return "; ".join(parts)
     if isinstance(value, (list, tuple)):
         return ", ".join(str(v) for v in value)

@@ -6,6 +6,8 @@ the promote flow is exercised through the ``atlas_client`` host (conftest.py).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from atlas import config as atlas_config
@@ -271,6 +273,32 @@ def test_promote_creates_publication_and_marks_idea(atlas_client, tmp_path):
 
 def test_promote_unknown_idea_returns_404(atlas_client):
     assert atlas_client.post("/api/plugins/atlas/ideas/gibt-es-nicht/promote").status_code == 404
+
+
+def test_a_failed_publication_write_leaves_the_idea_unpromoted(atlas_client, tmp_path, monkeypatch):
+    """Review 2026-10-18 (A3): the Publication is written before the idea is
+    marked — a lock on the new file (OneDrive) answers 423 and leaves the
+    idea exactly as it was, never ``promoted`` without its Publication."""
+    idea = atlas_client.post("/api/plugins/atlas/ideas", json={"title": "FGC Bahnplanung"}).json()
+    idea_file = tmp_path / "ideen" / f"{idea['id']}.md"
+    before = idea_file.read_bytes()
+    publications = tmp_path / "veroeffentlichungen"
+    real = Path.write_text
+
+    def write_text(self, *args, **kwargs):
+        if Path(self).parent == publications:
+            raise PermissionError(13, "gesperrt", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    res = atlas_client.post(f"/api/plugins/atlas/ideas/{idea['id']}/promote")
+    monkeypatch.setattr(Path, "write_text", real)
+
+    assert (res.status_code, res.json()["detail"]) == (423, "error.atlas.document_locked")
+    assert idea_file.read_bytes() == before
+    assert list(publications.glob("*.md")) == []
+    assert atlas_client.get(f"/api/plugins/atlas/ideas/{idea['id']}").json()["status"] == idea["status"]
+    assert atlas_client.get("/api/plugins/atlas/publications").json()["publications"] == []
 
 
 def test_promote_two_ideas_with_same_title_get_unique_publication_ids(atlas_client):

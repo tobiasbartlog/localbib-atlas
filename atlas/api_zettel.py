@@ -25,15 +25,21 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from atlas.api_errors import AtlasRoute
 from atlas.domain import parse_checklist
+from atlas.index_links import KIND_IDEA, KIND_ZETTEL
+from atlas.journal_store import WeekUnreadable
 from atlas.weeks import week_id
-from atlas.zettel import idea_from_zettel, new_zettel, unique_zettel_id
+from atlas.zettel import idea_from_zettel, new_zettel
 
 # Error codes — the SPA resolves them, the backend never translates.
 ERR_ZETTEL_NOT_FOUND = "error.atlas.zettel_not_found"
 ERR_TITLE_REQUIRED = "error.atlas.title_required"
 ERR_CHECKLIST_INDEX_INVALID = "error.atlas.checklist_index_invalid"
 ERR_ALREADY_PROMOTED = "error.atlas.already_promoted"
+# derive-tasks writes into today's week file — the codes of api_journal.py.
+ERR_WEEK_UNREADABLE = "error.atlas.week_unreadable"
+ERR_DOCUMENT_LOCKED = "error.atlas.document_locked"
 
 
 # =============================================================================
@@ -110,27 +116,13 @@ def _derived_indices(store, zettel) -> list[int]:
     return [i for i, item in enumerate(items) if item["text"] in existing]
 
 
-def _unique_zettel_id(store, base: str) -> str:
-    return unique_zettel_id(base, [z.id for z in store.list_zettel()])
-
-
-def _unique_idea_id(store, base: str) -> str:
-    base = base or "zettel"
-    if store.get_idea(base) is None:
-        return base
-    n = 2
-    while store.get_idea(f"{base}-{n}") is not None:
-        n += 1
-    return f"{base}-{n}"
-
-
 # =============================================================================
 # Router
 # =============================================================================
 
 def build_zettel_router(store, broadcaster) -> APIRouter:
     """The ``/zettel`` part of the Atlas API. Mounted by ``api.build_router``."""
-    router = APIRouter(prefix="/zettel", tags=["atlas-zettel"])
+    router = APIRouter(prefix="/zettel", tags=["atlas-zettel"], route_class=AtlasRoute)
 
     def _changed(kind: str = "zettel") -> None:
         broadcaster.publish({"type": "archive-changed", "kind": kind})
@@ -172,7 +164,7 @@ def build_zettel_router(store, broadcaster) -> APIRouter:
         if payload.body is not None:
             fields["body"] = payload.body
         zettel = new_zettel(title, today=_today(), **fields)
-        zettel.id = _unique_zettel_id(store, zettel.id)
+        zettel.id = store.free_id(KIND_ZETTEL, zettel.id)
         # UI write path: file first, then index (single DB writer) — the
         # watcher would also catch the new file, but indexing here makes the
         # request immediately consistent for the caller too.
@@ -216,7 +208,8 @@ def build_zettel_router(store, broadcaster) -> APIRouter:
         anchor is reported in ``already`` instead of duplicated — an empty
         ``indices`` list is a no-op that just reports (nothing to derive);
         use ``GET /zettel/{id}`` (``derived_indices``) to see the whole
-        picture without deriving anything."""
+        picture without deriving anything. Today's week file not parsing is
+        409 naming it, a lock 423 — nothing is written into it."""
         zettel = _zettel_or_404(zettel_id)
         items = parse_checklist(zettel.body)["items"]
         for idx in payload.indices:
@@ -233,7 +226,17 @@ def build_zettel_router(store, broadcaster) -> APIRouter:
             if text in existing:
                 already.append(idx)
                 continue
-            task = store.add_task(week, day.isoformat(), f"{text} [[{zettel.id}]]")
+            try:
+                task = store.add_task(week, day.isoformat(), f"{text} [[{zettel.id}]]")
+            except (WeekUnreadable, OSError) as exc:  # the ones before stand
+                if created:
+                    _changed("journal")
+                if isinstance(exc, WeekUnreadable):
+                    params = {"week": exc.week, "file": exc.file}
+                    raise HTTPException(
+                        status_code=409, detail={"code": ERR_WEEK_UNREADABLE, "params": params}
+                    )
+                raise HTTPException(status_code=423, detail=ERR_DOCUMENT_LOCKED)
             created.append(_task_wire(week, task))
             existing.add(text)
         if created:
@@ -253,8 +256,11 @@ def build_zettel_router(store, broadcaster) -> APIRouter:
         if zettel.promoted_to:
             raise HTTPException(status_code=409, detail=ERR_ALREADY_PROMOTED)
 
+        # A hand edit of the Zettel the index has not read stops the whole
+        # promote (409 error.atlas.file_changed) before the Idea exists.
+        store.ensure_current(KIND_ZETTEL, zettel)
         idea = idea_from_zettel(zettel, today=_today())
-        idea.id = _unique_idea_id(store, idea.id)
+        idea.id = store.free_id(KIND_IDEA, idea.id or "zettel")
         idea_path = store.save_idea_file(idea)
         store.index_file(idea_path)
 

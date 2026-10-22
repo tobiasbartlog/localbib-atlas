@@ -129,10 +129,12 @@ def plan_migration(
     existing_publication_ids: Iterable[str],
 ) -> MigrationPlan:
     """Pure planner. ``files``: ``(filename, text)`` pairs from ``projekte/``;
-    ``existing_publication_ids``: stems already taken in ``veroeffentlichungen/``.
+    ``existing_publication_ids``: stems already taken in ``veroeffentlichungen/``,
+    compared without case (Windows/macOS file names ignore it: ``foo.md``
+    would open a hand-named ``Foo.md``).
     No I/O, no clock — fully deterministic for a given input."""
     plan = MigrationPlan()
-    taken = set(existing_publication_ids)
+    taken = {t.casefold() for t in existing_publication_ids}
     for name, text in sorted(files):
         try:
             fm, body = parse_frontmatter(text)
@@ -152,16 +154,16 @@ def plan_migration(
         legacy = _LegacyProject.from_frontmatter(fm, body, stem=Path(name).stem)
 
         new_id = legacy.id or Path(name).stem
-        if new_id in taken:
+        if new_id.casefold() in taken:
             base, n = new_id, 2
-            while f"{base}-{n}" in taken:
+            while f"{base}-{n}".casefold() in taken:
                 n += 1
             new_id = f"{base}-{n}"
             plan.warnings.append(
                 f"{name}: id '{base}' kollidiert mit bestehender Veroeffentlichung"
                 f" — umbenannt zu '{new_id}'"
             )
-        taken.add(new_id)
+        taken.add(new_id.casefold())
 
         old_status = legacy.status
         new_status = STATUS_MAP.get(old_status)
@@ -622,7 +624,8 @@ def plan_core_project_migration(
 ) -> CoreProjectMigrationPlan:
     """Pure planner. ``core_projects``: wire dicts from the library facade
     (``{id, name, description, refs}``); ``existing_project_ids``: stems already
-    taken in ``projekte/``. No I/O, no clock — deterministic for a given input.
+    taken in ``projekte/``, compared without case like the file system of
+    Windows/macOS. No I/O, no clock — deterministic for a given input.
 
     Each core project becomes one ``atlas.project/3`` research project:
     ``title`` = name, ``refs`` = the grouped papers' Cite Keys (de-duplicated,
@@ -631,7 +634,7 @@ def plan_core_project_migration(
     no Atlas counterpart and is dropped. Id collisions (with existing Atlas
     projects or within the batch) get a ``-2``/``-3``… suffix plus a warning."""
     plan = CoreProjectMigrationPlan()
-    taken = set(existing_project_ids)
+    taken = {t.casefold() for t in existing_project_ids}
     for core in sorted(
         core_projects, key=lambda c: (str(c.get("name") or ""), str(c.get("id")))
     ):
@@ -648,16 +651,16 @@ def plan_core_project_migration(
             plan.warnings.append(
                 f"Kern-Projekt {core_id}: ohne Namen — Projekt bleibt invalid"
             )
-        if new_id in taken:
+        if new_id.casefold() in taken:
             base, n = new_id, 2
-            while f"{base}-{n}" in taken:
+            while f"{base}-{n}".casefold() in taken:
                 n += 1
             new_id = f"{base}-{n}"
             plan.warnings.append(
                 f"Kern-Projekt {core_id} ({name!r}): id '{base}' kollidiert mit"
                 f" bestehendem Atlas-Projekt — umbenannt zu '{new_id}'"
             )
-        taken.add(new_id)
+        taken.add(new_id.casefold())
 
         refs: list[str] = []
         for ref in core.get("refs") or []:

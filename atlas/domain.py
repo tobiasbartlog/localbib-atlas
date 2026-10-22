@@ -31,7 +31,9 @@ _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*$")
 # =============================================================================
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Split ``text`` into (frontmatter dict, body). No frontmatter → ({}, text)."""
+    """Split ``text`` into (frontmatter dict, body). No frontmatter → ({}, text).
+    A leading BOM ("UTF-8 mit BOM", Windows PowerShell 5.1) is no content."""
+    text = text.removeprefix("\ufeff")
     match = _FRONTMATTER_RE.match(text)
     if not match:
         return {}, text
@@ -344,19 +346,67 @@ def diss_progress(nodes: list["DissNode"]) -> dict:
 
 
 # =============================================================================
-# Research Project entity (ADR-0004, schemas/atlas.project-4.json)
+# Research Project entity (ADR-0004, schemas/atlas.project-5.json)
 # =============================================================================
 # Beware: atlas.project/3 is a DIFFERENT entity than /1|/2 — those are legacy
 # Publications and are converted by the startup migration (atlas/migration.py).
 
-PROJECT_SCHEMA = "atlas.project/4"
+PROJECT_SCHEMA = "atlas.project/5"
 # /4 (ADR-0022, issue #205): optional ``collection_id`` + ``kind`` — the Atlas
-# side of a core Collection. /3 files stay readable (same fields minus the
-# Collection link) and are written as /4 on their next save.
+# side of a core Collection. /5: optional ``history`` (the Verlauf, see
+# :func:`record_history`). /3 and /4 files stay readable and are written as /5
+# on their next save.
 PROJECT_STATUSES = {"planned", "applied", "active", "finished", "rejected"}
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _CHECKLIST_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$")
+
+
+# =============================================================================
+# Verlauf (history) — Publication and Project
+# =============================================================================
+
+def normalize_history_entry(raw) -> dict:
+    """Coerce one ``history`` entry to ``{date, status, venue}`` (venue may be
+    None). Tolerant like the entity parsers; validation reports problems."""
+    if not isinstance(raw, dict):
+        return {"date": None, "status": _as_str(raw) or "", "venue": None}
+    venue = raw.get("venue")
+    return {
+        "date": _as_str(raw.get("date")),
+        "status": str(raw.get("status") or ""),
+        "venue": str(venue) if venue else None,
+    }
+
+
+def record_history(history: list, status: str, today: date, venue: Optional[str] = None) -> list[dict]:
+    """The Verlauf after a status change: the old entries plus one for
+    ``status`` on ``today`` (with the venue it happened at, if any). Pure —
+    returns a new list, the caller persists it."""
+    entry = {"date": today.isoformat(), "status": status, "venue": venue or None}
+    return [normalize_history_entry(e) for e in history] + [entry]
+
+
+def _history_frontmatter(history: list) -> list[dict]:
+    out = []
+    for raw in history:
+        e = normalize_history_entry(raw)
+        item: dict = {"date": e["date"], "status": e["status"]}
+        if e["venue"]:
+            item["venue"] = e["venue"]
+        out.append(item)
+    return out
+
+
+def _history_errors(history: list, statuses) -> list[str]:
+    errors: list[str] = []
+    for i, raw in enumerate(history):
+        e = normalize_history_entry(raw)
+        if not e["date"] or not _ISO_DATE_RE.match(e["date"]):
+            errors.append(f"Verlauf {i + 1}: date ist kein ISO-Datum (YYYY-MM-DD): {e['date']!r}")
+        if e["status"] not in statuses:
+            errors.append(f"Verlauf {i + 1}: status ungueltig: {e['status']!r}")
+    return errors
 
 
 def _scan_lines(body: str):
@@ -491,6 +541,7 @@ class Project:
     tags: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
     milestones: list[dict] = field(default_factory=list)
+    history: list[dict] = field(default_factory=list)
     body: str = ""
     path: Optional[str] = None
     # Collection entry (atlas.project/4, ADR-0022): the core Collection whose
@@ -530,6 +581,7 @@ class Project:
             tags=list(fm.get("tags") or []),
             refs=[str(r) for r in (fm.get("refs") or [])],
             milestones=[normalize_milestone(m) for m in (fm.get("milestones") or [])],
+            history=[normalize_history_entry(h) for h in (fm.get("history") or [])],
             body=body.strip("\n"),
             collection_id=_as_collection_id(fm.get("collection_id")),
             kind=str(fm["kind"]) if fm.get("kind") else None,
@@ -571,6 +623,8 @@ class Project:
             fm["milestones"] = [
                 _milestone_frontmatter(normalize_milestone(m)) for m in self.milestones
             ]
+        if self.history:
+            fm["history"] = _history_frontmatter(self.history)
         return fm
 
     def to_markdown(self) -> str:
@@ -590,6 +644,7 @@ class Project:
             "tags": list(self.tags),
             "refs": list(self.refs),
             "milestones": [normalize_milestone(m) for m in self.milestones],
+            "history": [normalize_history_entry(h) for h in self.history],
             "body": self.body,
             "path": self.path,
             "checklist": cl,
@@ -601,7 +656,7 @@ class Project:
         }
 
     def validate(self) -> list[str]:
-        """Structural problems (mirrors schemas/atlas.project-4.json). Empty
+        """Structural problems (mirrors schemas/atlas.project-5.json). Empty
         list == valid. Hanging refs need the library — see store.check()."""
         errors: list[str] = []
         fm = self.to_frontmatter()
@@ -624,6 +679,7 @@ class Project:
                 errors.append(
                     f"Meilenstein {i + 1}: date ist kein ISO-Datum (YYYY-MM-DD): {m['date']!r}"
                 )
+        errors.extend(_history_errors(self.history, PROJECT_STATUSES))
         stem = _stem(self.path)
         if stem is not None and self.id and self.id != stem:
             errors.append(f"id '{self.id}' != Dateiname '{stem}'")
@@ -651,13 +707,14 @@ def new_project(title: str, **fields) -> Project:
 
 
 # =============================================================================
-# Publication entity (ADR-0004, schemas/atlas.publication-2.json)
+# Publication entity (ADR-0004, schemas/atlas.publication-3.json)
 # =============================================================================
 
-PUBLICATION_SCHEMA = "atlas.publication/2"
+PUBLICATION_SCHEMA = "atlas.publication/3"
 # /2 (ADR-0022, issue #205): optional ``collection_id`` + ``kind`` — the Atlas
-# side of a core Collection. /1 files stay readable and are written as /2 on
-# their next save.
+# side of a core Collection. /3: optional ``history`` (the Verlauf, every
+# status change with its date and venue). /1 and /2 files stay readable and
+# are written as /3 on their next save.
 # The one list of a Publication's states, in the Pipeline's order (#225): its
 # five columns, then the two folded away below. pipeline and agenda derive
 # from these, never re-declare them.
@@ -691,6 +748,7 @@ class Publication:
     manuscripts: list[str] = field(default_factory=list)
     projects: list[str] = field(default_factory=list)
     paper: Optional[str] = None
+    history: list[dict] = field(default_factory=list)
     body: str = ""
     path: Optional[str] = None
     # Collection entry (atlas.publication/2, ADR-0022): the core Collection
@@ -725,6 +783,7 @@ class Publication:
             manuscripts=[str(m) for m in (fm.get("manuscripts") or [])],
             projects=list(fm.get("projects") or []),
             paper=fm.get("paper") if fm.get("paper") else None,
+            history=[normalize_history_entry(h) for h in (fm.get("history") or [])],
             body=body.strip("\n"),
             collection_id=_as_collection_id(fm.get("collection_id")),
             kind=str(fm["kind"]) if fm.get("kind") else None,
@@ -772,6 +831,8 @@ class Publication:
             fm["projects"] = list(self.projects)
         if self.paper:
             fm["paper"] = self.paper
+        if self.history:
+            fm["history"] = _history_frontmatter(self.history)
         return fm
 
     def to_markdown(self) -> str:
@@ -794,6 +855,7 @@ class Publication:
             "manuscripts": list(self.manuscripts),
             "projects": list(self.projects),
             "paper": self.paper,
+            "history": [normalize_history_entry(h) for h in self.history],
             "body": self.body,
             "path": self.path,
             "collection_id": self.collection_id,
@@ -805,7 +867,7 @@ class Publication:
         }
 
     def validate(self) -> list[str]:
-        """Structural problems (mirrors schemas/atlas.publication-2.json). Empty
+        """Structural problems (mirrors schemas/atlas.publication-3.json). Empty
         list == valid. Hanging refs/links need the library/archive — store.check()."""
         errors: list[str] = []
         fm = self.to_frontmatter()
@@ -819,6 +881,7 @@ class Publication:
             errors.append(f"status ungueltig: {self.status!r} (erlaubt: {sorted(PUBLICATION_STATUSES)})")
         if self.type and self.type not in PUBLICATION_TYPES:
             errors.append(f"type ungueltig: {self.type!r} (erlaubt: {sorted(PUBLICATION_TYPES)})")
+        errors.extend(_history_errors(self.history, PUBLICATION_STATUSES))
         stem = _stem(self.path)
         if stem is not None and self.id and self.id != stem:
             errors.append(f"id '{self.id}' != Dateiname '{stem}'")

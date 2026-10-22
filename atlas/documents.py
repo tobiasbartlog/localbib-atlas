@@ -39,7 +39,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from atlas import config
+from atlas import config, entity_store
 
 _PROJECT_ID_RE = re.compile(r"[\w-]+", re.UNICODE)
 # Windows-reserved characters plus path separators; control chars are checked
@@ -191,11 +191,11 @@ class DocumentFolder:
         Atlas before #226) stays where it is and is never inherited. The type
         switch passes ``count_folders=False``: it keeps its id, so references
         do not break, and :meth:`move_to` sets an orphan folder aside. An id
-        no folder can have (outside ``[\\w-]+``, a hand-named file) has none."""
-        root = self._root()
+        no folder can have (outside ``[\\w-]+``, a hand-named file) has none.
+        The suffix loop and the ``.md`` rule are :func:`entity_store.free_id`."""
 
         def taken(candidate: str) -> bool:
-            if exists(candidate) or (root / f"{candidate}.md").exists():
+            if exists(candidate):
                 return True
             if not count_folders:
                 return False
@@ -204,12 +204,7 @@ class DocumentFolder:
             except ValueError:
                 return False
 
-        if not taken(base):
-            return base
-        n = 2
-        while taken(f"{base}-{n}"):
-            n += 1
-        return f"{base}-{n}"
+        return entity_store.free_id(base, taken, self._root())
 
     def set_aside(self, entity_id: str, today: Optional[date] = None) -> Optional[Path]:
         """The entity is gone: its folder must not resurface under a NEW entity
@@ -293,3 +288,14 @@ def open_in_viewer(path: Path) -> None:
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+def reveal_in_folder(path: Path) -> None:
+    """Show ``path`` selected in the system file manager ("Im Atlas-Ordner
+    zeigen"); where that is not possible, open its folder."""
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer", "/select,", str(path)])  # noqa: S603,S607 - explicit user action
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(Path(path).parent)])

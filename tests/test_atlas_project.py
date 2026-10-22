@@ -153,7 +153,7 @@ def test_project_round_trip_preserves_all_fields():
 def test_project_minimal_frontmatter_omits_empty_optionals():
     proj = new_project("Nur Titel")
     assert proj.to_frontmatter() == {
-        "schema": "atlas.project/4",
+        "schema": "atlas.project/5",
         "id": "nur-titel",
         "title": "Nur Titel",
         "status": "planned",

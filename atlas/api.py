@@ -19,11 +19,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from atlas import compiler, documents, manuscripts, project_extraction
+from atlas import api_errors, compiler, documents, manuscripts, project_extraction
 from atlas.api_journal import build_journal_router
 from atlas.api_links import build_links_router, chapter_metrics
 from atlas.api_publication import remove_entity_files
-from atlas.api_writing import build_writing_router, manuscript_bibliography
+from atlas.api_writing import HistoryUpdate, build_writing_router, manuscript_bibliography
 from atlas.api_zettel import build_zettel_router
 from atlas.domain import (
     DissNode,
@@ -36,6 +36,7 @@ from atlas.domain import (
     publication_from_idea,
     slugify,
 )
+from atlas.index_links import KIND_DISS_NODE, KIND_IDEA, KIND_PROJECT, KIND_PUBLICATION
 
 
 class IdeaCreate(BaseModel):
@@ -112,7 +113,7 @@ class ProjectCreate(BaseModel):
     body: Optional[str] = None
 
 
-class ProjectUpdate(BaseModel):
+class ProjectUpdate(HistoryUpdate):
     # All optional — only provided fields are applied. id stays fixed (= filename).
     title: Optional[str] = None
     status: Optional[str] = None
@@ -162,7 +163,7 @@ class PublicationCreate(BaseModel):
     body: Optional[str] = None
 
 
-class PublicationUpdate(BaseModel):
+class PublicationUpdate(HistoryUpdate):
     # All optional — only provided fields are applied. id stays fixed (= filename).
     title: Optional[str] = None
     status: Optional[str] = None
@@ -229,29 +230,10 @@ def _serialize(idea) -> dict:
     return data
 
 
-def _unique_id(store, base: str) -> str:
-    if store.get_idea(base) is None:
-        return base
-    n = 2
-    while store.get_idea(f"{base}-{n}") is not None:
-        n += 1
-    return f"{base}-{n}"
-
-
 def _node_dict(node) -> dict:
     data = node.to_dict()
     data["errors"] = node.validate()
     return data
-
-
-def _unique_node_id(store, base: str) -> str:
-    base = base or "knoten"
-    if store.get_node(base) is None:
-        return base
-    n = 2
-    while store.get_node(f"{base}-{n}") is not None:
-        n += 1
-    return f"{base}-{n}"
 
 
 def _project_dict(project) -> dict:
@@ -285,16 +267,6 @@ def _zettel_dict(zettel) -> dict:
     return data
 
 
-def _unique_publication_id(store, base: str) -> str:
-    # A leftover document folder makes an id taken, too (never inherited).
-    return documents.PUBLICATIONS.free_id(
-        base or "veroeffentlichung", lambda i: store.get_publication(i) is not None)
-
-
-def _unique_project_id(store, base: str) -> str:
-    return documents.PROJECTS.free_id(base or "projekt", lambda i: store.get_project(i) is not None)
-
-
 def _manuscript_stem(name: str) -> str:
     """Manuscript id from a linked name — links may carry the .tex suffix."""
     return name[:-4] if name.lower().endswith(".tex") else name
@@ -326,7 +298,7 @@ def _toggle_checklist_item(body: str, index: int) -> str:
 def build_router(store, broadcaster, llm=None, library=None, settings=None) -> APIRouter:
     """``llm``/``library``/``settings`` are host services from PluginApi (Phase 4,
     #228). Without them the matching endpoints answer 503 — the rest works."""
-    router = APIRouter(prefix="/api/plugins/atlas", tags=["atlas"])
+    router = APIRouter(prefix="/api/plugins/atlas", tags=["atlas"], route_class=api_errors.AtlasRoute)
 
     def _resolve_citekey_entry(citekey: str) -> dict:
         """Resolve one cite key against the library for display. Hanging keys
@@ -369,7 +341,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
         idea.venue = payload.venue
         if payload.body is not None:
             idea.body = payload.body
-        idea.id = _unique_id(store, idea.id)
+        idea.id = store.free_id(KIND_IDEA, idea.id)
         # UI write path: file first, then index (single DB writer). The watcher
         # will also catch the new file; we index + broadcast here so the request
         # is immediately consistent for the caller too.
@@ -406,11 +378,11 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
         idea = store.get_idea(idea_id)
         if idea is None:
             raise HTTPException(status_code=404, detail="Idee nicht gefunden")
+        store.ensure_current(KIND_IDEA, idea)  # an unread hand edit stops it all (409)
         publication = publication_from_idea(idea)
-        publication.id = _unique_publication_id(store, publication.id)
-        pub_path = store.save_publication_file(publication)
+        publication.id = store.free_id(KIND_PUBLICATION, publication.id or "veroeffentlichung")
+        pub_path = store.save_publication_file(publication)  # first: a lock leaves the idea as it was
         store.index_publication_file(pub_path)
-
         idea.status = "promoted"
         idea.updated = date.today().isoformat()
         idea_path = store.save_idea_file(idea)
@@ -439,7 +411,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
             if not idea.title.strip():
                 raise HTTPException(status_code=400, detail="Datei hat weder id noch Titel")
             idea.id = make_idea_id(idea.title)
-        idea.id = _unique_id(store, idea.id)
+        idea.id = store.free_id(KIND_IDEA, idea.id)
         path = store.save_idea_file(idea)
         store.index_file(path)
         broadcaster.publish({"type": "ideas-changed"})
@@ -447,19 +419,16 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
 
     @router.get("/links/{citekey}")
     async def links_for(citekey: str):
-        """Ideas, publications, research projects and Zettel referencing this
-        library citekey — the backward-link panel the Paper detail page uses
-        (cite-key usage lookup, story 38). ``zettel`` is additive (issue
-        #180) — the existing shape stays backwards compatible."""
+        """Ideas, publications, research projects, Zettel and chapters citing
+        this library citekey (refs or ``[@key]`` in the body, ADR-0026) — the
+        backward-link panel of the Paper detail page (story 38). ``zettel``
+        (#180) and ``chapters`` are additive; the shape stays compatible."""
         return {
             "ideas": [_serialize(i) for i in store.links_for(citekey)],
-            "publications": [
-                _publication_dict(p) for p in store.publications_for_citekey(citekey)
-            ],
-            "projects": [
-                _project_dict(p) for p in store.projects_for_citekey(citekey)
-            ],
+            "publications": [_publication_dict(p) for p in store.publications_for_citekey(citekey)],
+            "projects": [_project_dict(p) for p in store.projects_for_citekey(citekey)],
             "zettel": [_zettel_dict(z) for z in store.zettel_for_citekey(citekey)],
+            "chapters": [_node_dict(n) for n in store.nodes_for_citekey(citekey)],
         }
 
     def _node_publications_resolved(node) -> list[dict]:
@@ -527,7 +496,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
             body=payload.body or "",
         )
         base = (payload.id or "").strip() or slugify(title)
-        node.id = _unique_node_id(store, base)
+        node.id = store.free_id(KIND_DISS_NODE, base or "knoten")
         path = store.save_node_file(node)
         store.index_diss_file(path)
         broadcaster.publish({"type": "diss-changed"})
@@ -707,7 +676,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
             body=payload.body or "",
         )
         base = (payload.id or "").strip() or slugify(title)
-        project.id = _unique_project_id(store, base)
+        project.id = store.free_id(KIND_PROJECT, base or "projekt")
         path = store.save_project_file(project)
         store.index_project_file(path)
         broadcaster.publish({"type": "projects-changed"})
@@ -722,7 +691,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
         for field in ("title", "status", "start", "end", "funder", "grant_id", "role", "body"):
             if field in changes:
                 setattr(project, field, changes[field])  # None clears the field
-        for field in ("tags", "refs", "milestones"):
+        for field in ("tags", "refs", "milestones", "history"):
             if field in changes and changes[field] is not None:
                 setattr(project, field, changes[field])
         if not (project.title or "").strip():
@@ -978,7 +947,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
             body=payload.body or "",
         )
         base = (payload.id or "").strip() or slugify(title)
-        publication.id = _unique_publication_id(store, base)
+        publication.id = store.free_id(KIND_PUBLICATION, base or "veroeffentlichung")
         path = store.save_publication_file(publication)
         store.index_publication_file(path)
         broadcaster.publish({"type": "publications-changed"})
@@ -994,7 +963,7 @@ def build_router(store, broadcaster, llm=None, library=None, settings=None) -> A
                       "published", "due", "paper", "body"):
             if field in changes:
                 setattr(publication, field, changes[field])  # None clears the field
-        for field in ("authors", "tags", "refs", "derived_from", "manuscripts", "projects"):
+        for field in ("authors", "tags", "refs", "derived_from", "manuscripts", "projects", "history"):
             if field in changes and changes[field] is not None:
                 setattr(publication, field, changes[field])
         if not (publication.title or "").strip():
